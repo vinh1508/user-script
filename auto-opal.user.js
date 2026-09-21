@@ -239,7 +239,7 @@
   }
 
   function buildDownloadPath(folderName, fileName) {
-    return `${folderName}/${fileName}`;
+    return `truyen/translated/${folderName}/${fileName}`;
   }
 
   function hasNextText() {
