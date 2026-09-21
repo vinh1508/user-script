@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Opal Auto Run
 // @namespace    opal-auto-run
-// @version      2026-09-19.4
+// @version      2026-09-21.1
 // @description  Auto run queued text inputs in an Opal app.
 // @author       You
 // @match        https://opal.google/app/*
