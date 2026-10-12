@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name               Auto Skip Ads – YouTube, YouTube Music & Spotify
 // @name:vi            Tự Động Bỏ Qua Quảng Cáo – YouTube, YouTube Music & Spotify
-// @version            8.0.0
-// @description        Auto skip ads on YouTube & YouTube Music. Mute + fast-forward audio ads on Spotify Web Player.
-// @description:vi     Tự động bỏ qua quảng cáo trên YouTube & YouTube Music. Tắt tiếng + tua nhanh quảng cáo trên Spotify Web.
+// @version            8.1.0
+// @description        Auto skip ads on YouTube & YouTube Music. Skip (or mute) audio ads on Spotify Web Player.
+// @description:vi     Tự động bỏ qua quảng cáo trên YouTube & YouTube Music. Bỏ qua (hoặc tắt tiếng) quảng cáo trên Spotify Web.
 // @author             AI
 // @icon               https://cdn-icons-png.flaticon.com/64/2504/2504965.png
 // @match              https://www.youtube.com/*
@@ -13,6 +13,7 @@
 // @exclude            https://studio.youtube.com/*
 // @grant              none
 // @run-at             document-start
+// @inject-into        page
 // @license            MIT
 // @noframes
 // ==/UserScript==
@@ -22,10 +23,6 @@
 
     // Bật true để xem log trong DevTools Console
     const DEBUG = false
-
-    // Spotify: có thử bấm nút "Next" khi đang có quảng cáo hay không.
-    // Nếu phát hiện nhầm quảng cáo, nút này sẽ skip luôn bài hát => tắt nếu gặp lỗi.
-    const SPOTIFY_TRY_SKIP = true
 
     const HOST = location.hostname
     const SITE =
@@ -95,7 +92,8 @@
         '.ytp-skip-ad-button',
         '.ytp-ad-skip-button',
         '.ytp-ad-skip-button-modern',
-        '.ytp-ad-skip-button-slot button'
+        '.ytp-ad-skip-button-slot button',
+        '.ytp-skip-ad button'
     ]
 
     function ytGetPlayer() {
@@ -109,12 +107,11 @@
     }
 
     function ytGetVideo() {
-        // Đúng cho cả www, mobile và music (bản cũ dùng #ytd-player nên hỏng trên mobile)
         return document.querySelector('#movie_player video.html5-main-video')
     }
 
     // =====================================================================
-    // YouTube (www + mobile) – giữ cơ chế reload video của bản gốc
+    // YouTube (www + mobile) – KHÔNG ĐỔI so với 8.0.0
     // =====================================================================
     const YT_HIDE = [
         // Banner quảng cáo góc trên phải, phía trên playlist
@@ -139,7 +136,6 @@
         ytMutedByScript = false
         const video = ytGetVideo()
         const { player } = ytGetPlayer()
-        // Chỉ bỏ tắt tiếng nếu chính player không ở trạng thái mute (tôn trọng lựa chọn của người dùng)
         if (video && video.muted && typeof player?.isMuted === 'function' && !player.isMuted()) {
             video.muted = false
             log('Restored audio after ad')
@@ -184,11 +180,6 @@
         log('Ad skipped', { videoId, start, title: videoData.title })
     }
 
-    /**
-     * Xoá phần tử quảng cáo bằng JS vì cần logic giống `:has`
-     * (không hỗ trợ trên trình duyệt cũ). Bản cũ chỉ xoá phần tử đầu tiên,
-     * bản này xoá tất cả.
-     */
     function removeYouTubeAdElements() {
         const pairs = [
             // Video quảng cáo trong YouTube Shorts
@@ -202,8 +193,18 @@
     }
 
     // =====================================================================
-    // YouTube Music – bấm Skip / tua tới cuối, không reload để giữ hàng đợi
+    // YouTube Music
+    // - Chạy theo SỰ KIỆN (MutationObserver + media events) thay vì chỉ polling:
+    //   tab nhạc thường nằm nền, Chrome bóp setInterval còn ~1 lần/giây.
+    // - Khôi phục âm thanh / tốc độ NGAY khi hết quảng cáo, tránh bài hát bị
+    //   phát câm hoặc 16x trong vài trăm ms đầu (mất vài giây đầu bài).
     // =====================================================================
+
+    // Chỉ tua tới cuối nếu quảng cáo ngắn hơn ngưỡng này (giây). Dài hơn thì
+    // tăng tốc 16x thay vì tua, phòng trường hợp quảng cáo bị ghép thẳng vào
+    // stream bài hát (tua tới cuối sẽ nhảy qua luôn cả bài).
+    const YTM_SEEK_MAX_DURATION = 120
+
     const YTM_HIDE = [
         // Popup mời dùng thử Premium góc dưới trái
         'ytmusic-mealbar-promo-renderer',
@@ -212,25 +213,31 @@
         '.ytp-featured-product'
     ]
 
-    let ytmAdState = null // { video, muted, rate }
+    let ytmAdState = null // { video, muted, rate, changedRate }
+    let ytmObservedPlayer = null
+    let ytmPlayerObserver = null
+    let ytmBoundVideo = null
 
-    function ytmRestore() {
-        const { video, muted, rate } = ytmAdState
-        ytmAdState = null
-        if (!video) return
-        video.muted = muted
-        setRate(video, rate)
-        log('Ad ended, restored audio & speed', { muted, rate })
-    }
-
-    function skipYouTubeMusicAd() {
-        const playerEl = document.querySelector('#movie_player')
-        const isAd = !!playerEl && (
+    function ytmIsAdShowing(playerEl) {
+        return !!playerEl && (
             playerEl.classList.contains('ad-showing') ||
             playerEl.classList.contains('ad-interrupting')
         )
+    }
 
-        if (!isAd) {
+    function ytmRestore() {
+        const { video, muted, rate, changedRate } = ytmAdState
+        ytmAdState = null
+        video.muted = muted
+        // Chỉ trả lại tốc độ nếu script đã đổi, không đè cài đặt của YouTube
+        if (changedRate) setRate(video, rate)
+        log('YTM: ad ended, restored', { muted, rate: changedRate ? rate : 'unchanged' })
+    }
+
+    function ytmCheck() {
+        const playerEl = document.querySelector('#movie_player')
+
+        if (!ytmIsAdShowing(playerEl)) {
             if (ytmAdState) ytmRestore()
             return
         }
@@ -238,129 +245,224 @@
         const video = ytGetVideo()
         if (!video) return
 
+        if (ytmAdState && ytmAdState.video !== video) ytmRestore()
         if (!ytmAdState) {
-            // Lưu trạng thái của người dùng để khôi phục sau quảng cáo
-            ytmAdState = { video, muted: video.muted, rate: video.playbackRate || 1 }
-            log('Ad detected')
+            ytmAdState = { video, muted: video.muted, rate: video.playbackRate || 1, changedRate: false }
+            log('YTM: ad detected')
         }
 
         video.muted = true
 
-        if (clickFirst(YT_SKIP_BUTTONS)) {
-            log('Clicked skip button')
-            return
+        // Bấm Skip nếu có, nhưng KHÔNG return: YouTube có thể bỏ qua click giả lập
+        // (event.isTrusted = false), nên vẫn tua / tăng tốc ở dưới.
+        if (clickFirst(YT_SKIP_BUTTONS)) log('YTM: clicked skip button')
+
+        const d = video.duration
+        if (isFinite(d) && d > 0 && d <= YTM_SEEK_MAX_DURATION) {
+            if (video.currentTime < d - 0.25) {
+                try {
+                    video.currentTime = d
+                    log('YTM: seeked to end', { duration: d })
+                } catch (_) { /* bỏ qua */ }
+            }
+        } else if (video.playbackRate < 16) {
+            // Chưa biết thời lượng, hoặc quảng cáo quá dài => tăng tốc
+            setRate(video, 16)
+            ytmAdState.changedRate = true
+        }
+    }
+
+    function ytmBind() {
+        const playerEl = document.querySelector('#movie_player')
+        if (playerEl && playerEl !== ytmObservedPlayer) {
+            ytmPlayerObserver?.disconnect()
+            ytmPlayerObserver = new MutationObserver(ytmCheck)
+            ytmPlayerObserver.observe(playerEl, { attributes: true, attributeFilter: ['class'] })
+            ytmObservedPlayer = playerEl
+            log('YTM: observing player')
         }
 
-        // Không skip được thì tua tới cuối + tăng tốc
-        if (isFinite(video.duration) && video.duration > 0 && video.currentTime < video.duration - 0.25) {
-            try { video.currentTime = video.duration } catch (_) { /* bỏ qua */ }
+        const video = ytGetVideo()
+        if (video && video !== ytmBoundVideo) {
+            for (const type of ['loadedmetadata', 'durationchange', 'playing', 'timeupdate']) {
+                video.addEventListener(type, ytmCheck)
+            }
+            ytmBoundVideo = video
+            log('YTM: bound video events')
         }
-        if (video.playbackRate < 16) setRate(video, 16)
     }
 
     // =====================================================================
     // Spotify Web Player (open.spotify.com)
-    // Quảng cáo audio của Spotify không có nút skip => tắt tiếng + tua nhanh.
-    // Selector có thể đổi khi Spotify cập nhật, chỉnh trong object này.
+    //
+    // Phát hiện chính: nhạc/podcast của Spotify phát qua MediaSource nên src là
+    // "blob:https://open.spotify.com/...", còn quảng cáo là file media trực tiếp
+    // (URL thường) và ngắn. Cách này không phụ thuộc ngôn ngữ giao diện hay
+    // data-testid, và chạy theo sự kiện nên phản ứng ngay cả khi tab ở nền.
+    //
+    // Xử lý: tắt tiếng -> tua tới cuối. Nếu Spotify bị treo ở màn
+    // "Your music will continue after the break" (không chuyển bài), phát lại
+    // quảng cáo từ đầu nhưng vẫn tắt tiếng để Spotify tự chạy tiếp.
     // =====================================================================
     const SPOTIFY = {
-        adSignals: [
+        // Quảng cáo audio thường 15–30s; nhạc / podcast dài hơn nhiều
+        adMaxDuration: 70,
+        // Chờ bao lâu (ms) sau khi tua để kiểm tra Spotify có bị treo không
+        stuckCheckDelay: 400,
+        // Media không phải quảng cáo: Canvas (video lặp sau bài hát), preview 30s
+        ignoreSrc: /canvaz\.scdn\.co|p\.scdn\.co\/mp3-preview/i,
+
+        // Dự phòng: phát hiện qua giao diện => chỉ TẮT TIẾNG, không tua.
+        // Đặt false nếu bị tắt tiếng nhầm bài hát.
+        domFallback: true,
+        domAdSelectors: [
             '[data-testid="context-item-info-ad-subtitle"]',
-            '[data-testid="now-playing-widget"] a[href*="/ad/"]',
-            '[data-testid="now-playing-widget"][aria-label*="advertisement" i]'
+            '[data-testid="now-playing-widget"] a[href*="/ad/"]'
         ],
-        titlePattern: /^(advertisement|quảng cáo)\b|spotify\s*[–-]\s*advertisement/i,
-        skipButton: '[data-testid="control-button-skip-forward"]',
-        muteButton: '[data-testid="volume-bar-toggle-mute-button"]',
+        adLabel: /\badvertisement\b|quảng cáo/i,
+        adTitle: /^(advertisement|quảng cáo)\b|spotify\s*[–—-]\s*(advertisement|quảng cáo)/i,
+
         hide: [
             // Nút "Khám phá Premium" trên thanh top
             '[data-testid="upgrade-button"]',
-            // Banner/quảng cáo nhúng
+            // Banner / quảng cáo nhúng
             '[data-testid="embedded-ad"]'
         ]
     }
 
-    const spotifyMedia = new Set()
+    const spMedia = new Set()        // mọi <audio>/<video> bắt được
+    const spBound = new WeakSet()    // element đã gắn listener
+    const spMuted = new Map()        // element -> trạng thái muted gốc
+    const spSkipTried = new Map()    // element -> src đã thử tua
+    let spLastPlaySrc = ''
 
-    // Spotify tạo <audio>/<video> không gắn vào DOM, nên phải bắt lúc tạo / lúc play.
+    function spSrc(el) {
+        return el.currentSrc || el.src || ''
+    }
+
+    /** 'content' | 'ad' | 'pending' (chưa biết thời lượng) | 'ignore' */
+    function spClassify(el) {
+        const src = spSrc(el)
+        if (!src) return 'ignore'
+        if (src.startsWith('blob:')) return 'content'
+        if (el.loop || SPOTIFY.ignoreSrc.test(src)) return 'ignore'
+        const d = el.duration
+        if (Number.isNaN(d) || d <= 0) return 'pending'
+        if (!isFinite(d)) return 'content'
+        return d <= SPOTIFY.adMaxDuration ? 'ad' : 'content'
+    }
+
+    function spDomAdActive() {
+        if (SPOTIFY.domAdSelectors.some(sel => document.querySelector(sel))) return true
+        const widget = document.querySelector('[data-testid="now-playing-widget"]')
+        if (widget && SPOTIFY.adLabel.test(widget.getAttribute('aria-label') || '')) return true
+        return SPOTIFY.adTitle.test(document.title)
+    }
+
+    function spMute(el) {
+        if (!spMuted.has(el)) spMuted.set(el, el.muted)
+        el.muted = true
+    }
+
+    function spUnmute(el) {
+        if (!spMuted.has(el)) return
+        el.muted = spMuted.get(el)
+        spMuted.delete(el)
+    }
+
+    function spRestoreAll() {
+        if (!spMuted.size) return
+        for (const el of [...spMuted.keys()]) spUnmute(el)
+        spSkipTried.clear()
+        log('Spotify: ad ended, audio restored')
+    }
+
+    function spTrySkip(el) {
+        const src = spSrc(el)
+        if (el.paused || spSkipTried.get(el) === src) return
+        spSkipTried.set(el, src)
+
+        try {
+            el.currentTime = el.duration
+        } catch (_) {
+            return
+        }
+        log('Spotify: ad seeked to end', { duration: el.duration })
+
+        setTimeout(() => {
+            const stuck = el.ended && spSrc(el) === src && spLastPlaySrc === src
+            if (!stuck) return
+            // Spotify không chuyển bài => phát lại quảng cáo (vẫn tắt tiếng),
+            // spSkipTried giữ src này nên sẽ không tua lần nữa.
+            log('Spotify: skip did not advance, replaying ad muted')
+            spMute(el)
+            el.currentTime = 0
+            el.play().catch(() => { /* bỏ qua */ })
+        }, SPOTIFY.stuckCheckDelay)
+    }
+
+    function spOnMediaEvent(e) {
+        const el = e.currentTarget
+        if (e.type === 'play') spLastPlaySrc = spSrc(el)
+
+        const kind = spClassify(el)
+        if (kind === 'ignore') return
+
+        if (kind === 'ad' || kind === 'pending') {
+            // 'pending': tắt tiếng tạm cho tới khi biết thời lượng, tránh lọt tiếng quảng cáo
+            spMute(el)
+            if (kind === 'ad') spTrySkip(el)
+            return
+        }
+
+        // kind === 'content'
+        if (SPOTIFY.domFallback && spDomAdActive()) return
+        spUnmute(el) // vd. podcast bị tắt tiếng tạm khi chưa biết thời lượng
+        if (e.type === 'playing') spRestoreAll()
+    }
+
+    function spTrack(el) {
+        spMedia.add(el)
+        if (spBound.has(el)) return
+        spBound.add(el)
+        for (const type of ['play', 'playing', 'loadedmetadata', 'durationchange']) {
+            el.addEventListener(type, spOnMediaEvent)
+        }
+    }
+
+    // Spotify tạo <audio>/<video> không gắn vào DOM => bắt lúc tạo và lúc play().
     // Cần @run-at document-start để hook chạy trước code của Spotify.
     function spotifyHookMedia() {
         const origCreate = Document.prototype.createElement
         Document.prototype.createElement = function (tagName, options) {
             const el = origCreate.call(this, tagName, options)
-            if (typeof tagName === 'string' && /^(audio|video)$/i.test(tagName)) {
-                spotifyMedia.add(el)
-                log('Captured media element (createElement)', { tag: tagName })
-            }
+            if (el instanceof HTMLMediaElement) spTrack(el)
             return el
         }
 
         const origPlay = HTMLMediaElement.prototype.play
         HTMLMediaElement.prototype.play = function () {
-            spotifyMedia.add(this)
+            spTrack(this)
             return origPlay.apply(this, arguments)
         }
     }
 
-    function spotifyGetPlayingMedia() {
-        document.querySelectorAll('audio, video').forEach(el => spotifyMedia.add(el))
-        return [...spotifyMedia].filter(el => !el.paused)
-    }
+    // Vòng kiểm tra chậm: bắt media trong DOM + dự phòng theo giao diện
+    function spTick() {
+        document.querySelectorAll('audio, video').forEach(spTrack)
 
-    function spotifyIsAd() {
-        if (SPOTIFY.adSignals.some(sel => document.querySelector(sel))) return true
-        return SPOTIFY.titlePattern.test(document.title)
-    }
-
-    let spAdState = null // { entries: Map<el, {muted, rate}>, clickedMute }
-
-    function spotifyRestore() {
-        for (const [el, s] of spAdState.entries) {
-            el.muted = s.muted
-            setRate(el, s.rate)
-        }
-        if (spAdState.clickedMute) {
-            document.querySelector(SPOTIFY.muteButton)?.click()
-        }
-        spAdState = null
-        log('Ad ended, restored audio & speed')
-    }
-
-    function handleSpotifyAd() {
-        const isAd = spotifyIsAd()
-
-        if (!isAd) {
-            if (spAdState) spotifyRestore()
+        if (SPOTIFY.domFallback && spDomAdActive()) {
+            for (const el of spMedia) {
+                if (!el.paused && spClassify(el) !== 'ignore') spMute(el)
+            }
             return
         }
 
-        if (!spAdState) {
-            spAdState = { entries: new Map(), clickedMute: false }
-            log('Ad detected', { title: document.title })
-        }
-
-        const media = spotifyGetPlayingMedia()
-        for (const el of media) {
-            if (!spAdState.entries.has(el)) {
-                spAdState.entries.set(el, { muted: el.muted, rate: el.playbackRate || 1 })
-            }
-            el.muted = true
-            if (el.playbackRate < 16) setRate(el, 16)
-        }
-
-        // Dự phòng: không bắt được media element thì bấm nút mute trên UI
-        if (media.length === 0 && !spAdState.clickedMute) {
-            const btn = document.querySelector(SPOTIFY.muteButton)
-            if (btn) {
-                btn.click()
-                spAdState.clickedMute = true
-                log('Muted via UI button (fallback)')
-            }
-        }
-
-        if (SPOTIFY_TRY_SKIP && clickFirst([SPOTIFY.skipButton])) {
-            log('Clicked next button during ad')
-        }
+        if (!spMuted.size) return
+        const adStillPlaying = [...spMuted.keys()].some(el =>
+            !el.paused && !el.ended && spClassify(el) !== 'content'
+        )
+        if (!adStillPlaying) spRestoreAll()
     }
 
     // =====================================================================
@@ -370,14 +472,18 @@
         spotifyHookMedia()
         onReady(() => {
             injectCss(SPOTIFY.hide)
-            handleSpotifyAd()
-            window.setInterval(handleSpotifyAd, 300)
+            spTick()
+            window.setInterval(spTick, 500)
         })
     } else if (SITE === 'ytmusic') {
         onReady(() => {
             injectCss(YTM_HIDE)
-            skipYouTubeMusicAd()
-            window.setInterval(skipYouTubeMusicAd, 300)
+            ytmBind()
+            ytmCheck()
+            window.setInterval(() => {
+                ytmBind()
+                ytmCheck()
+            }, 1000)
         })
     } else {
         onReady(() => {
