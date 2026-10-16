@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         AdShield – Chặn quảng cáo & popup bung tab
+// @name         AdShield – Chặn quảng cáo & hỏi trước khi mở tab mới
 // @namespace    vinhtt.adshield
-// @version      1.1.0
-// @description  Ẩn quảng cáo, chặn script quảng cáo, chặn click bị bung tab/cửa sổ. Alt+Shift+A: tắt/bật cho trang. Alt+Shift+S: chế độ nghiêm ngặt.
+// @version      1.2.0
+// @description  Ẩn quảng cáo, chặn script quảng cáo, mọi tab/cửa sổ mới đều phải xác nhận. Alt+Shift+A: tắt/bật cho trang. Alt+Shift+R: xoá danh sách cho phép.
 // @match        *://*/*
 // @run-at       document-start
 // @grant        none
@@ -15,13 +15,17 @@
 
   /* ========================= CẤU HÌNH ========================= */
   const CFG = {
+    // 'all'   = hỏi trước MỌI tab/cửa sổ mới (kể cả cùng trang)
+    // 'cross' = cùng trang thì mở luôn, sang trang khác hoặc đáng ngờ thì hỏi
+    // 'off'   = không hỏi: tự chặn tab đáng ngờ, cho qua tab bình thường
+    confirm: 'all',
     cosmetic: true,          // Ẩn phần tử quảng cáo bằng CSS
     blockAdRequests: true,   // Chặn script/iframe/fetch/XHR tới domain quảng cáo
-    popupGuard: true,        // Chặn bung tab/cửa sổ mới
-    gestureWindowMs: 2000,   // Popup chỉ hợp lệ trong khoảng này sau thao tác thật
-    bigLinkRatio: 0.6,       // Link/nút chiếm >= 60% màn hình mà mở trang ngoài => coi là bẫy
+    popupGuard: true,        // Kiểm soát tab/cửa sổ mới
+    gestureWindowMs: 2000,   // Tab mới chỉ được xét nếu xảy ra trong khoảng này sau thao tác thật
+    bigLinkRatio: 0.6,       // Link/nút chiếm >= 60% màn hình mà mở trang ngoài => nghi bẫy
     showToast: true,
-    debug: true,             // Log ra Console (F12) mọi lần mở tab mới: CHO PHÉP hay CHẶN
+    debug: true,             // Log ra Console (F12)
     extraSelectors: [],      // vd: '.banner-nha-cai'
     extraHosts: [],          // vd: 'abc-ads.xyz'
   };
@@ -76,73 +80,195 @@
   const sameOrigin = (u) => { try { return new URL(u, location.href).origin === location.origin; } catch (_) { return false; } };
   const stripHash = (u) => String(u).split('#')[0];
   const opensNewContext = (t) => { t = (t || '').toLowerCase(); return !!t && !['_self', '_parent', '_top'].includes(t); };
+  const realTarget = (e) => (e.composedPath && e.composedPath()[0]) || e.target;
   const safe = (name, fn) => { try { fn(); } catch (e) { console.warn('[AdShield]', name, e); } };
   const log = (...a) => { if (CFG.debug) console.info('%c[AdShield]', 'color:#2f81f7;font-weight:bold', ...a); };
 
-  /* ---------- Toast ---------- */
-  let toastUI = null, toastTimer = 0;
-  function hideToast() { if (toastUI) toastUI.host.remove(); }
+  /* ========================= UI: toast + hộp xác nhận (closed shadow DOM) ========================= */
+  // Mọi sự kiện trên UI bị chặn ngay ở window-capture: script của trang không bao giờ thấy click vào UI.
+  let UI = null, toastTimer = 0, blockedCount = 0;
+
+  const UI_CSS = `
+    [hidden]{display:none!important}
+    *{box-sizing:border-box;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+    .toast{position:fixed;right:16px;bottom:16px;max-width:min(420px,calc(100vw - 32px));display:flex;gap:8px;
+      align-items:center;padding:10px 12px;border-radius:8px;background:#1f2328;color:#f0f3f6;font-size:13px;
+      line-height:1.4;box-shadow:0 6px 20px rgba(0,0,0,.35)}
+    .backdrop{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;
+      justify-content:center;padding:16px}
+    .dialog{width:min(460px,100%);background:#fff;color:#1f2328;border-radius:12px;padding:18px 18px 14px;
+      box-shadow:0 12px 40px rgba(0,0,0,.35);font-size:14px;line-height:1.45}
+    .title{font-weight:700;font-size:15px;margin-bottom:10px}
+    .host{font-size:18px;font-weight:700;word-break:break-all}
+    .url{margin-top:4px;color:#59636e;font-size:12px;word-break:break-all;max-height:4.6em;overflow:auto}
+    .warn{margin-top:10px;padding:8px 10px;border-radius:8px;background:#fff1e5;color:#953800;font-size:13px}
+    .warn.ok{background:#ddf4ff;color:#0a3069}
+    .allow{display:flex;gap:8px;align-items:center;margin-top:12px;font-size:13px;color:#59636e;cursor:pointer}
+    .btns{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
+    button{all:unset;cursor:pointer;padding:7px 14px;border-radius:7px;font-weight:600;font-size:13px}
+    button:focus-visible{outline:2px solid #2f81f7;outline-offset:2px}
+    .pri{background:#1f6feb;color:#fff}
+    .sec{background:#eff2f5;color:#1f2328}
+    .toast .pri{padding:3px 9px}
+    .x{background:transparent;color:#9198a1;padding:3px 5px}
+    @media (prefers-color-scheme:dark){
+      .dialog{background:#1f2328;color:#f0f3f6}.url,.allow{color:#9198a1}
+      .sec{background:#30363d;color:#f0f3f6}.warn{background:#3d2a12;color:#f0b072}
+      .warn.ok{background:#0c2d4a;color:#9cd1ff}}`;
+
+  function h(tag, attrs, ...kids) {
+    const e = document.createElement(tag);
+    if (attrs) for (const k in attrs) k === 'text' ? (e.textContent = attrs[k]) : e.setAttribute(k, attrs[k]);
+    kids.forEach((k) => N.append.call(e, k));
+    return e;
+  }
+
+  function ensureUI() {
+    if (UI) return UI;
+    const host = document.createElement('adshield-ui');
+    host.style.cssText = 'all:initial!important;display:block!important;position:fixed!important;top:0!important;' +
+      'left:0!important;width:0!important;height:0!important;z-index:2147483647!important';
+    const sr = host.attachShadow({ mode: 'closed' });
+
+    const toastMsg = h('span');
+    const toastOpen = h('button', { class: 'pri', 'data-act': 'toast-open', text: 'Mở' });
+    const toast = h('div', { class: 'toast' }, toastMsg, toastOpen,
+      h('button', { class: 'x', 'data-act': 'toast-close', text: '✕' }));
+    toast.hidden = true;
+
+    const mHost = h('div', { class: 'host' });
+    const mUrl = h('div', { class: 'url' });
+    const mWarn = h('div', { class: 'warn' });
+    const mCb = h('input', { type: 'checkbox' });
+    const mCbText = h('span');
+    const mAllow = h('label', { class: 'allow' }, mCb, mCbText);
+    const mBlock = h('button', { class: 'sec', 'data-act': 'block', text: 'Chặn' });
+    const mOpen = h('button', { class: 'pri', 'data-act': 'open', text: 'Mở tab' });
+    const dialog = h('div', { class: 'dialog', role: 'dialog', 'aria-modal': 'true', 'data-act': 'noop' },
+      h('div', { class: 'title', text: 'Trang này muốn mở tab mới' }), mHost, mUrl, mWarn, mAllow,
+      h('div', { class: 'btns' }, mBlock, mOpen));
+    const modal = h('div', { class: 'backdrop', 'data-act': 'block' }, dialog);
+    modal.hidden = true;
+
+    N.append.call(sr, h('style', { text: UI_CSS }));
+    N.append.call(sr, toast);
+    N.append.call(sr, modal);
+    UI = { host, sr, toast, toastMsg, toastOpen, toastUrl: null, modal, mHost, mUrl, mWarn, mCb, mCbText,
+      mAllow, mBlock, pending: null };
+    return UI;
+  }
+  function mountUI() {
+    ensureUI();
+    const root = document.documentElement;
+    if (!root) return false;
+    if (!UI.host.isConnected) N.append.call(root, UI.host);
+    return true;
+  }
+
   function toast(msg, openUrl) {
-    if (!CFG.showToast || !document.documentElement) return;
-    if (!toastUI) {
-      const host = document.createElement('adshield-toast');
-      const sr = host.attachShadow({ mode: 'closed' });
-      const style = document.createElement('style');
-      style.textContent =
-        '.box{position:fixed;right:16px;bottom:16px;z-index:2147483647;max-width:400px;display:flex;' +
-        'gap:8px;align-items:center;padding:10px 12px;border-radius:8px;background:#1f2328;color:#f0f3f6;' +
-        'font:13px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;box-shadow:0 6px 20px rgba(0,0,0,.35)}' +
-        'button{all:unset;cursor:pointer;padding:3px 9px;border-radius:5px;background:#2f81f7;color:#fff;font-weight:600}' +
-        'button.x{background:transparent;color:#9198a1;padding:3px 5px}button.x:hover{color:#fff}';
-      const box = document.createElement('div'); box.className = 'box';
-      const msgEl = document.createElement('span');
-      const openBtn = document.createElement('button'); openBtn.textContent = 'Mở';
-      const closeBtn = document.createElement('button'); closeBtn.className = 'x'; closeBtn.textContent = '✕';
-      box.append(msgEl, openBtn, closeBtn);
-      sr.append(style, box);
-      toastUI = { host, msgEl, openBtn, url: null };
-      on(openBtn, 'click', () => { if (toastUI.url) N.open.call(window, toastUI.url, '_blank', 'noopener'); hideToast(); }, false);
-      on(closeBtn, 'click', hideToast, false);
-    }
-    toastUI.msgEl.textContent = msg;
-    toastUI.url = openUrl || null;
-    toastUI.openBtn.style.display = openUrl ? '' : 'none';
-    if (!toastUI.host.isConnected) N.append.call(document.documentElement, toastUI.host);
+    if (!CFG.showToast || !mountUI()) return;
+    UI.toastMsg.textContent = msg;
+    UI.toastUrl = openUrl || null;
+    UI.toastOpen.hidden = !openUrl;
+    UI.toast.hidden = false;
     clearTimeout(toastTimer);
     toastTimer = setTimeout(hideToast, 7000);
   }
+  function hideToast() { if (UI) UI.toast.hidden = true; }
+
+  // Hiện hộp xác nhận. doOpen() sẽ được gọi trong chính cú click "Mở tab" của bạn (trình duyệt cho phép mở).
+  function askOpen(href, reason, doOpen) {
+    if (!mountUI()) return false;
+    const host = hostOf(href);
+    UI.pending = { href, host, doOpen };
+    UI.mHost.textContent = host || (href === 'about:blank' ? 'Trang trống (about:blank)' : href);
+    UI.mUrl.textContent = href;
+    UI.mWarn.className = reason ? 'warn' : 'warn ok';
+    UI.mWarn.textContent = reason ? '⚠ Nghi quảng cáo: ' + reason : 'Mở từ link/nút bạn vừa bấm.';
+    UI.mAllow.hidden = !host;
+    UI.mCb.checked = false;
+    UI.mCbText.textContent = `Luôn cho phép ${host} trên ${location.hostname} (không hỏi lại)`;
+    UI.modal.hidden = false;
+    setTimeout(() => UI.mBlock.focus(), 0);
+    return true;
+  }
+  function closeModal() { if (UI) { UI.modal.hidden = true; UI.pending = null; } }
+  const waitingConfirm = () => !!(UI && UI.pending);
+
+  function uiAct(act) {
+    if (act === 'toast-open') {
+      const u = UI.toastUrl; hideToast();
+      if (u) N.open.call(window, u, '_blank');
+    } else if (act === 'toast-close') {
+      hideToast();
+    } else if (act === 'open' || act === 'block') {
+      const p = UI.pending;
+      const remember = UI.mCb.checked;
+      closeModal();
+      if (!p) return;
+      if (act === 'open') {
+        if (remember && p.host) addAllow(p.host);
+        log('BẠN ĐỒNG Ý mở:', p.href);
+        try { p.doOpen(); } catch (err) { console.warn('[AdShield] mở thất bại', err); }
+      } else {
+        blockedCount++;
+        log('BẠN ĐÃ CHẶN:', p.href);
+      }
+    }
+  }
+
+  ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'dblclick', 'auxclick', 'contextmenu',
+    'touchstart', 'touchend', 'keydown', 'keyup', 'keypress'].forEach((t) => on(window, t, (e) => {
+    if (!UI || realTarget(e) !== UI.host) return;
+    e.stopImmediatePropagation();
+    if (!e.isTrusted) return; // trang không thể "bấm hộ" nút Mở
+    if (t === 'click') {
+      const el = e.detail === 0 && UI.sr.activeElement ? UI.sr.activeElement : UI.sr.elementFromPoint(e.clientX, e.clientY);
+      const actEl = el && el.closest ? el.closest('[data-act]') : null;
+      if (actEl) uiAct(actEl.getAttribute('data-act'));
+    } else if (t === 'keydown' && e.key === 'Escape' && waitingConfirm()) {
+      e.preventDefault();
+      uiAct('block');
+    }
+  }));
 
   /* ---------- Cài đặt theo trang ---------- */
-  const KEY_OFF = '__adshield_off', KEY_STRICT = '__adshield_strict';
-  const lsGet = (k) => { try { return localStorage.getItem(k) === '1'; } catch (_) { return false; } };
-  const lsSet = (k, v) => { try { v ? localStorage.setItem(k, '1') : localStorage.removeItem(k); } catch (_) {} };
-  const isOff = lsGet(KEY_OFF);
-  let strict = lsGet(KEY_STRICT);
+  const KEY_OFF = '__adshield_off', KEY_ALLOW = '__adshield_allow';
+  let isOff = false;
+  try { isOff = localStorage.getItem(KEY_OFF) === '1'; } catch (_) {}
+  let allowHosts = [];
+  try { allowHosts = JSON.parse(localStorage.getItem(KEY_ALLOW) || '[]'); } catch (_) {}
+  if (!Array.isArray(allowHosts)) allowHosts = [];
+  const isAllowed = (host) => !!host && allowHosts.includes(host);
+  function addAllow(host) {
+    if (isAllowed(host)) return;
+    allowHosts.push(host);
+    try { localStorage.setItem(KEY_ALLOW, JSON.stringify(allowHosts)); } catch (_) {}
+    toast(`Đã thêm ${host} vào danh sách cho phép của trang này`);
+  }
 
   if (isTop) {
     on(window, 'keydown', (e) => {
       if (!e.altKey || !e.shiftKey) return;
       if (e.code === 'KeyA') {
         e.preventDefault();
-        lsSet(KEY_OFF, !isOff);
+        try { isOff ? localStorage.removeItem(KEY_OFF) : localStorage.setItem(KEY_OFF, '1'); } catch (_) {}
         toast(isOff ? 'AdShield: đã BẬT lại cho trang này' : 'AdShield: đã TẮT cho trang này');
         setTimeout(() => location.reload(), 700);
-      } else if (e.code === 'KeyS' && !isOff) {
+      } else if (e.code === 'KeyR') {
         e.preventDefault();
-        strict = !strict;
-        lsSet(KEY_STRICT, strict);
-        toast(strict
-          ? 'AdShield: BẬT nghiêm ngặt — mọi tab mới sang trang khác đều bị chặn (bấm "Mở" nếu cần)'
-          : 'AdShield: TẮT chế độ nghiêm ngặt');
+        allowHosts = [];
+        try { localStorage.removeItem(KEY_ALLOW); } catch (_) {}
+        toast('AdShield: đã xoá danh sách cho phép của trang này');
       }
     });
   }
   if (isOff) { log('đang TẮT cho trang này (Alt+Shift+A để bật)'); return; }
-  if (isTop) log('đang chạy trên', location.host, strict ? '(nghiêm ngặt)' : '');
+  if (isTop) log('đang chạy trên', location.host, '| chế độ xác nhận:', CFG.confirm);
 
   /* ========================= 1. ẨN QUẢNG CÁO BẰNG CSS ========================= */
   if (CFG.cosmetic) safe('cosmetic', () => {
-    const iframeSel = AD_HOSTS.filter((h) => h.includes('.')).map((h) => `iframe[src*="${h}"]`);
+    const iframeSel = AD_HOSTS.filter((x) => x.includes('.')).map((x) => `iframe[src*="${x}"]`);
     const st = document.createElement('style');
     st.textContent = COSMETIC.concat(iframeSel)
       .map((s) => `${s}{display:none!important;visibility:hidden!important}`).join('\n');
@@ -225,10 +351,10 @@
     });
   }
 
-  /* ========================= 4. CHẶN POPUP / TAB MỚI ========================= */
+  /* ========================= 4. KIỂM SOÁT TAB / CỬA SỔ MỚI ========================= */
   if (!CFG.popupGuard) return;
 
-  // 4a. Biết code đang chạy trong listener gắn ở đâu (document/window/body = kiểu popunder toàn trang)
+  // 4a. Biết code mở tab đang chạy trong listener gắn ở đâu (document/window/body = popunder toàn trang)
   const CTX = [];
   const GESTURE_TYPES = new Set(['click', 'mousedown', 'mouseup', 'pointerdown', 'pointerup',
     'touchstart', 'touchend', 'auxclick', 'keydown', 'keyup']);
@@ -256,7 +382,6 @@
       const w = listener && wrapped.get(listener);
       if (w) N.removeEL.call(this, type, w, opts);
     };
-    // document.onclick = ..., window.onmousedown = ...
     for (const obj of [HTMLElement.prototype, Document.prototype, window]) {
       for (const prop of ['onclick', 'onmousedown', 'onmouseup', 'onpointerdown', 'onpointerup', 'ontouchstart', 'ontouchend']) {
         safe(prop, () => {
@@ -284,7 +409,6 @@
 
   // 4b. Theo dõi thao tác thật của người dùng
   const G = { t: -Infinity, target: null, used: true, link: null, linkHref: null };
-  const realTarget = (e) => (e.composedPath && e.composedPath()[0]) || e.target;
   const closestLink = (el) => (el && el.closest ? el.closest('a[href],area[href]') : null);
   const startGesture = (e) => {
     if (!e.isTrusted) return;
@@ -342,37 +466,63 @@
     }
     return null;
   }
-
-  let blockedCount = 0;
-  function onBlocked(href, reason, el) {
-    blockedCount++;
+  function neutralizeOverlay(el) {
     let ov = el && suspiciousBox(el) ? el : null;
     if (!ov) ov = findTransparentOverlay(G.target);
     if (ov) ov.style.setProperty('pointer-events', 'none', 'important');
+    return !!ov;
+  }
+
+  function onBlocked(href, reason, el) {
+    blockedCount++;
+    const removed = neutralizeOverlay(el);
     const host = hostOf(href);
     const canOpen = href && href !== 'about:blank' && !isAdUrl(href);
-    toast((ov ? 'Đã chặn tab mới và gỡ lớp phủ. Hãy click lại. ' : 'Đã chặn tab mới. ') +
+    toast((removed ? 'Đã chặn tab mới và gỡ lớp phủ. ' : 'Đã chặn tab mới. ') +
       (host ? '→ ' + host + ' ' : '') + `(${blockedCount})`, canOpen ? href : null);
     log('CHẶN:', reason, href);
   }
 
-  // Quyết định: trả về lý do chặn, hoặc '' nếu cho phép
-  function popupVerdict(href) {
-    if (isAdUrl(href)) return 'domain quảng cáo';
-    if (!recentGesture()) return 'không có thao tác người dùng';
-    if (G.used) return 'tab thứ 2 trong cùng 1 click';
-    if (stripHash(href) === stripHash(location.href)) return 'tab-under (mở lại chính trang này)';
-    const cross = href === 'about:blank' || !sameOrigin(href);
-    if (strict && cross) return 'chế độ nghiêm ngặt';
-    if (cross && isGlobalCtx()) return 'listener gắn ở document/window/body';
+  // Dấu hiệu đáng ngờ của một lần mở tab bằng script ('' = không thấy gì bất thường)
+  function popupSuspicion(href) {
+    if (href === 'about:blank') return 'mở trang trống (chiêu hay dùng của popunder)';
+    if (stripHash(href) === stripHash(location.href)) return 'mở lại chính trang này (chiêu tab-under)';
+    const cross = !sameOrigin(href);
+    if (cross && isGlobalCtx()) return 'script gắn trên toàn trang tự mở, không phải link/nút bạn bấm';
     const it = interactiveOf(G.target);
-    if (!it) return 'click vào vùng không phải link/nút';
+    if (!it) return 'bạn click vào vùng không phải link/nút';
     if (cross) {
       const s = suspiciousBox(it);
-      if (s) return 'phần tử được click ' + s;
-      if ((it.tagName === 'A' || it.tagName === 'AREA') && stripHash(it.href) !== stripHash(href)) return 'link bị chiếm quyền';
+      if (s) return 'phần tử bạn click ' + s;
+      if ((it.tagName === 'A' || it.tagName === 'AREA') && stripHash(it.href) !== stripHash(href)) {
+        return 'bạn click link tới ' + (hostOf(it.href) || 'trang khác') + ' nhưng lại mở ' + hostOf(href);
+      }
     }
     return '';
+  }
+
+  // Quyết định cho một lần mở tab mới: allow | ask | block
+  function decide(href, susp) {
+    if (isAdUrl(href)) return { act: 'block', why: 'domain quảng cáo' };
+    if (waitingConfirm()) return { act: 'block', why: 'đang chờ bạn xác nhận một tab khác' };
+    if (!recentGesture()) return { act: 'block', why: 'không có thao tác người dùng' };
+    if (G.used) return { act: 'block', why: 'tab thứ 2 trong cùng 1 click' };
+    G.used = true;
+    if (isAllowed(hostOf(href))) return { act: 'allow', why: 'nằm trong danh sách cho phép' };
+    if (CFG.confirm === 'off') return susp ? { act: 'block', why: susp } : { act: 'allow', why: '' };
+    if (CFG.confirm === 'cross' && !susp && sameOrigin(href)) return { act: 'allow', why: 'cùng trang' };
+    return { act: 'ask', why: susp };
+  }
+
+  function handleNewTab(kind, href, susp, doOpen, el) {
+    const d = decide(href, susp);
+    if (d.act === 'allow') { log('CHO PHÉP', kind + ':', href, d.why); return 'allow'; }
+    if (d.act === 'ask') {
+      if (susp) neutralizeOverlay(el);
+      if (askOpen(href, d.why, doOpen)) { log('HỎI', kind + ':', href, d.why); return 'ask'; }
+    }
+    onBlocked(href, kind + ': ' + d.why, el);
+    return 'block';
   }
 
   function fakeWindow() {
@@ -396,11 +546,10 @@
     const href = toAbs(url);
     const newCtx = target == null || target === '' || opensNewContext(target);
     if (!newCtx && !isAdUrl(href)) return N.open.call(window, url, target, features);
-    const v = popupVerdict(href);
-    if (v) { onBlocked(href, 'window.open: ' + v); return fakeWindow(); }
-    G.used = true;
-    log('CHO PHÉP window.open:', href, '\n', new Error().stack);
-    return N.open.call(window, url, target, features);
+    const r = handleNewTab('window.open', href, popupSuspicion(href),
+      () => N.open.call(window, url, target, features));
+    if (r === 'allow') return N.open.call(window, url, target, features);
+    return fakeWindow();
   }
 
   safe('window.open', () => lockOpen(window));
@@ -421,81 +570,90 @@
 
   // 4c. Link do script tự tạo rồi .click() / dispatchEvent
   const isLinkEl = (el) => el instanceof HTMLAnchorElement || el instanceof HTMLAreaElement;
-  function linkVerdict(a) {
+  const relFeatures = (a) => {
+    const rel = (a.getAttribute('rel') || '').toLowerCase();
+    return rel.includes('noreferrer') ? 'noreferrer' : rel.includes('noopener') ? 'noopener' : '';
+  };
+  function linkGuard(a, kind) {
     const href = a.href;
-    if (!href || a.hasAttribute('download') || /^javascript:/i.test(href)) return '';
-    if (isAdUrl(href)) return 'domain quảng cáo';
-    if (!opensNewContext(a.getAttribute('target'))) return '';
-    return popupVerdict(href);
+    if (!href || a.hasAttribute('download') || /^javascript:/i.test(href)) return 'pass';
+    if (isAdUrl(href)) { onBlocked(href, kind + ': domain quảng cáo', a); return 'block'; }
+    const target = a.getAttribute('target');
+    if (!opensNewContext(target)) return 'pass';
+    return handleNewTab(kind, href, popupSuspicion(href), () => N.open.call(window, href, target, relFeatures(a)), a);
   }
   safe('link-click', () => {
     HTMLElement.prototype.click = function () {
       if (isLinkEl(this)) {
-        const v = linkVerdict(this);
-        if (v) { onBlocked(this.href, 'a.click(): ' + v); return; }
-        if (opensNewContext(this.getAttribute('target'))) { G.used = true; log('CHO PHÉP a.click():', this.href); }
+        const r = linkGuard(this, 'a.click()');
+        if (r === 'block' || r === 'ask') return;
       }
       return N.click.call(this);
     };
     EventTarget.prototype.dispatchEvent = function (ev) {
       if (ev && ev.type === 'click' && isLinkEl(this)) {
-        const v = linkVerdict(this);
-        if (v) { onBlocked(this.href, 'click giả: ' + v); return false; }
+        const r = linkGuard(this, 'click giả');
+        if (r === 'block' || r === 'ask') return false;
       }
       return N.dispatch.call(this, ev);
     };
   });
 
-  // 4d. Form tự submit sang tab mới
+  // 4d. Form submit sang tab mới
   safe('form', () => {
-    const guard = (form) => {
+    const guard = (form, resume) => {
       if (!opensNewContext(form.getAttribute('target'))) return true;
       const href = toAbs(form.getAttribute('action') || location.href);
-      const v = popupVerdict(href);
-      if (v) { onBlocked(href, 'form: ' + v); return false; }
-      G.used = true; return true;
+      return handleNewTab('form', href, popupSuspicion(href), resume) === 'allow';
     };
-    HTMLFormElement.prototype.submit = function () { if (guard(this)) return N.submit.call(this); };
+    HTMLFormElement.prototype.submit = function () {
+      if (guard(this, () => N.submit.call(this))) return N.submit.call(this);
+    };
     if (N.requestSubmit) {
-      HTMLFormElement.prototype.requestSubmit = function () { if (guard(this)) return N.requestSubmit.apply(this, arguments); };
+      HTMLFormElement.prototype.requestSubmit = function (...args) {
+        if (guard(this, () => N.submit.call(this))) return N.requestSubmit.apply(this, args);
+      };
     }
   });
 
-  // 4e. Click THẬT vào link: lớp phủ <a> vô hình/khổng lồ, link bị tráo href, link quảng cáo
+  // 4e. Bạn click THẬT vào link target="_blank" (hoặc lớp phủ <a> vô hình, link bị tráo href)
   on(window, 'click', (e) => {
     if (!e.isTrusted) return;
     const a = closestLink(realTarget(e));
     if (!a) return;
     const href = a.href;
     const curAttr = a.getAttribute('href');
-    const newCtx = opensNewContext(a.getAttribute('target'));
-    let reason = '';
+    const target = a.getAttribute('target');
+    const stop = () => { e.preventDefault(); e.stopImmediatePropagation(); };
 
-    if (isAdUrl(href)) reason = 'link tới domain quảng cáo';
+    let hard = '';
+    if (isAdUrl(href)) hard = 'link tới domain quảng cáo';
     else if (a === G.link && curAttr !== G.linkHref) {
-      const h = baseDomain(hostOf(href));
-      const oldH = baseDomain(hostOf(G.linkHref || ''));
-      if (h !== baseDomain(location.hostname) && h !== oldH) reason = 'href bị tráo lúc nhấn chuột';
+      const nh = baseDomain(hostOf(href));
+      if (nh !== baseDomain(location.hostname) && nh !== baseDomain(hostOf(G.linkHref || ''))) {
+        hard = 'href bị tráo lúc nhấn chuột';
+      }
     }
-    if (!reason && newCtx && !a.hasAttribute('download') && !sameOrigin(href)) {
-      const s = suspiciousBox(a);
-      if (s) reason = 'link ' + s;
-      else if (strict) reason = 'chế độ nghiêm ngặt';
-    }
-
-    if (reason) {
-      e.preventDefault();
-      e.stopImmediatePropagation();
+    if (hard) {
+      stop();
       if (a === G.link && curAttr !== G.linkHref) {
         G.linkHref == null ? a.removeAttribute('href') : a.setAttribute('href', G.linkHref);
       }
-      onBlocked(href, 'click link: ' + reason, a);
+      onBlocked(href, 'click link: ' + hard, a);
       return;
     }
-    if (newCtx) { G.used = true; log('CHO PHÉP link tab mới:', href); }
+
+    if (!opensNewContext(target) || a.hasAttribute('download') || /^javascript:/i.test(href)) return;
+    const sb = sameOrigin(href) ? '' : suspiciousBox(a);
+    const susp = sb ? 'link ' + sb : '';
+    // Ctrl/Cmd/Shift + click = bạn chủ động muốn tab mới
+    if (!susp && (e.ctrlKey || e.metaKey || e.shiftKey)) { G.used = true; return; }
+
+    const r = handleNewTab('click link', href, susp, () => N.open.call(window, href, target, relFeatures(a)), a);
+    if (r !== 'allow') stop();
   });
 
-  // 4f. Quét chủ động: <a>/<iframe> vô hình phủ toàn trang (không bao giờ là nội dung thật)
+  // 4f. Quét chủ động: <a>/<iframe> vô hình phủ toàn trang
   function scanOverlays() {
     const vp = innerWidth * innerHeight;
     if (!vp || !document.body) return;
