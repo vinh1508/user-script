@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         AdShield – Chặn quảng cáo & hỏi trước khi mở tab mới
+// @name         AdShield – Chặn quảng cáo & hỏi trước khi mở tab / chuyển trang
 // @namespace    vinhtt.adshield
-// @version      1.2.0
-// @description  Ẩn quảng cáo, chặn script quảng cáo, mọi tab/cửa sổ mới đều phải xác nhận. Alt+Shift+A: tắt/bật cho trang. Alt+Shift+R: xoá danh sách cho phép.
+// @version      1.4.0
+// @description  Ẩn quảng cáo, chặn script quảng cáo, mọi tab mới hoặc chuyển trang sang domain khác đều phải xác nhận; blacklist theo domain/query/URL có wildcard. Alt+Shift+A: tắt/bật cho trang. Alt+Shift+B: quản lý blacklist. Alt+Shift+R: xoá danh sách cho phép.
 // @match        *://*/*
 // @run-at       document-start
 // @grant        none
@@ -15,10 +15,22 @@
 
   /* ========================= CẤU HÌNH ========================= */
   const CFG = {
+    // Tab/cửa sổ mới:
     // 'all'   = hỏi trước MỌI tab/cửa sổ mới (kể cả cùng trang)
     // 'cross' = cùng trang thì mở luôn, sang trang khác hoặc đáng ngờ thì hỏi
     // 'off'   = không hỏi: tự chặn tab đáng ngờ, cho qua tab bình thường
     confirm: 'all',
+    // Khi click mà trang HIỆN TẠI bị chuyển sang domain khác:
+    // 'all'    = hỏi mọi lần (kể cả click link thường sang trang khác)
+    // 'script' = chỉ hỏi khi do script tự chuyển, hoặc link có dấu hiệu bẫy
+    // 'off'    = không kiểm tra
+    confirmNavigate: 'all',
+    navGestureMs: 5000,          // chuyển trang trong khoảng này sau click được coi là "do click gây ra"
+    confirmAutoRedirect: false,  // true = hỏi cả khi trang tự chuyển hướng mà không có click nào
+    // Blacklist dùng chung cho MỌI trang. Dạng 'loại:mẫu', hỗ trợ wildcard *:
+    //   'host:popads.xyz'   'host:*.adnet.*'   'query:zoneid=*'   'url:*://*/go.php?*'
+    // Blacklist thêm từ hộp xác nhận được lưu riêng cho từng trang; Alt+Shift+B để xem/xoá/sao chép.
+    blacklist: [],
     cosmetic: true,          // Ẩn phần tử quảng cáo bằng CSS
     blockAdRequests: true,   // Chặn script/iframe/fetch/XHR tới domain quảng cáo
     popupGuard: true,        // Kiểm soát tab/cửa sổ mới
@@ -76,45 +88,149 @@
     if (p.length > 2 && p[p.length - 1].length === 2 && p[p.length - 2].length <= 3) return p.slice(-3).join('.');
     return p.slice(-2).join('.');
   };
-  const isAdUrl = (u) => { const h = u ? hostOf(u) : ''; return !!h && AD_HOSTS.some((d) => h.includes(d)); };
+  const isAdUrl = (u) => { const x = u ? hostOf(u) : ''; return !!x && AD_HOSTS.some((d) => x.includes(d)); };
   const sameOrigin = (u) => { try { return new URL(u, location.href).origin === location.origin; } catch (_) { return false; } };
   const stripHash = (u) => String(u).split('#')[0];
+  const sameSite = (u) => { const x = hostOf(u); return !x || baseDomain(x) === baseDomain(location.hostname); };
   const opensNewContext = (t) => { t = (t || '').toLowerCase(); return !!t && !['_self', '_parent', '_top'].includes(t); };
   const realTarget = (e) => (e.composedPath && e.composedPath()[0]) || e.target;
   const safe = (name, fn) => { try { fn(); } catch (e) { console.warn('[AdShield]', name, e); } };
   const log = (...a) => { if (CFG.debug) console.info('%c[AdShield]', 'color:#2f81f7;font-weight:bold', ...a); };
 
-  /* ========================= UI: toast + hộp xác nhận (closed shadow DOM) ========================= */
-  // Mọi sự kiện trên UI bị chặn ngay ở window-capture: script của trang không bao giờ thấy click vào UI.
-  let UI = null, toastTimer = 0, blockedCount = 0;
+  /* ========================= LƯU TRỮ THEO TRANG ========================= */
+  const KEY_OFF = '__adshield_off', KEY_ALLOW = '__adshield_allow', KEY_BLOCK = '__adshield_block';
+  const lsList = (k) => { try { const v = JSON.parse(localStorage.getItem(k) || '[]'); return Array.isArray(v) ? v : []; } catch (_) { return []; } };
+  const lsSave = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (_) {} };
 
+  let isOff = false;
+  try { isOff = localStorage.getItem(KEY_OFF) === '1'; } catch (_) {}
+
+  let allowHosts = lsList(KEY_ALLOW).filter((x) => typeof x === 'string');
+  const isAllowed = (host) => !!host && allowHosts.includes(host);
+
+  /* ========================= BLACKLIST (wildcard *) ========================= */
+  const BL_TYPES = { host: 'Domain/host', query: 'Query string', url: 'Cả URL' };
+  const BL_HINTS = {
+    host: 'Hỗ trợ *. VD: ads.com (gồm cả subdomain), *.ads.com, pop*.xyz, *ads*.*',
+    query: 'Nhiều điều kiện nối bằng &, hỗ trợ *. VD: zoneid=*, utm_source=pop*, *=*popunder*, aff_id&sub=*',
+    url: 'So khớp toàn bộ URL, hỗ trợ *. VD: *://*/go.php?*, https://site.com/out/*',
+  };
+  const wild = (p) => new RegExp('^' + p.split('*').map((x) => x.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$', 'i');
+  const safeDecode = (s) => { try { return decodeURIComponent(s.replace(/\+/g, ' ')); } catch (_) { return s; } };
+
+  function compileRule(t, p) {
+    p = String(p == null ? '' : p).trim();
+    if (!p || !BL_TYPES[t]) return null;
+    try {
+      if (t === 'host') {
+        p = p.toLowerCase().replace(/^[a-z*]+:\/\//, '').replace(/[/:?#].*$/, '');
+        if (!p) return null;
+        const re = wild(p);
+        const bare = p.replace(/^\*\./, '');
+        const plain = bare.includes('*') ? null : bare; // "ads.com" / "*.ads.com" => ads.com và mọi subdomain
+        return { t, p, test: (u) => { const x = u.hostname.toLowerCase(); return re.test(x) || (!!plain && (x === plain || x.endsWith('.' + plain))); } };
+      }
+      if (t === 'query') {
+        p = p.replace(/^\?/, '');
+        const parts = p.split('&').filter(Boolean).map((part) => ({ re: wild(part), kv: part.includes('=') }));
+        if (!parts.length) return null;
+        return {
+          t, p, test: (u) => {
+            const pairs = u.search.replace(/^\?/, '').split('&').filter(Boolean);
+            if (!pairs.length) return false;
+            const cands = pairs.flatMap((x) => [x, safeDecode(x)]);
+            return parts.every((pt) => cands.some((kv) => pt.re.test(pt.kv ? kv : kv.split('=')[0])));
+          },
+        };
+      }
+      const re = wild(p);
+      return { t, p, test: (u) => re.test(u.href.split('#')[0]) || re.test(u.href) };
+    } catch (_) { return null; }
+  }
+  const ruleLabel = (r) => `${r.t}:${r.p}`;
+
+  const GLOBAL_RULES = CFG.blacklist.map((s) => {
+    const m = /^(host|query|url):(.*)$/i.exec(String(s));
+    return m ? compileRule(m[1].toLowerCase(), m[2]) : compileRule('host', s);
+  }).filter(Boolean);
+  let siteRules = lsList(KEY_BLOCK).map((e) => e && compileRule(e.t, e.p)).filter(Boolean);
+  const saveSiteRules = () => lsSave(KEY_BLOCK, siteRules.map(({ t, p }) => ({ t, p })));
+
+  function blacklistHit(href) {
+    if (!siteRules.length && !GLOBAL_RULES.length) return null;
+    let u;
+    try { u = new URL(href, location.href); } catch (_) { return null; }
+    if (!/^https?:$/.test(u.protocol)) return null;
+    return siteRules.find((r) => r.test(u)) || GLOBAL_RULES.find((r) => r.test(u)) || null;
+  }
+  // Lý do chặn thẳng (không hỏi) cho tab mới / chuyển trang / click link
+  function blockReason(href) {
+    if (!href) return '';
+    if (isAdUrl(href)) return 'domain quảng cáo';
+    const r = blacklistHit(href);
+    return r ? 'blacklist ' + ruleLabel(r) : '';
+  }
+
+  /* ========================= UI: toast, hộp xác nhận, bảng quản lý (closed shadow DOM) ========================= */
+  // Mọi sự kiện trên UI bị chặn ngay ở window-capture: script của trang không thấy và không "bấm hộ" được.
+  let UI = null, toastTimer = 0, blockedCount = 0;
+  let navBypassUntil = 0; // cho qua lần chuyển trang do chính bạn vừa đồng ý
+  const bypassNav = () => { navBypassUntil = performance.now() + 1500; };
+  function navTo(href) { bypassNav(); location.assign(href); }
+
+  const MONO = 'ui-monospace,SFMono-Regular,Menlo,Consolas,monospace';
   const UI_CSS = `
     [hidden]{display:none!important}
     *{box-sizing:border-box;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-    .toast{position:fixed;right:16px;bottom:16px;max-width:min(420px,calc(100vw - 32px));display:flex;gap:8px;
+    .toast{position:fixed;right:16px;bottom:16px;max-width:min(440px,calc(100vw - 32px));display:flex;gap:8px;
       align-items:center;padding:10px 12px;border-radius:8px;background:#1f2328;color:#f0f3f6;font-size:13px;
-      line-height:1.4;box-shadow:0 6px 20px rgba(0,0,0,.35)}
+      line-height:1.4;box-shadow:0 6px 20px rgba(0,0,0,.35);word-break:break-word}
     .backdrop{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;
       justify-content:center;padding:16px}
-    .dialog{width:min(460px,100%);background:#fff;color:#1f2328;border-radius:12px;padding:18px 18px 14px;
-      box-shadow:0 12px 40px rgba(0,0,0,.35);font-size:14px;line-height:1.45}
+    .dialog{width:min(480px,100%);max-height:calc(100vh - 32px);overflow:auto;background:#fff;color:#1f2328;
+      border-radius:12px;padding:18px 18px 14px;box-shadow:0 12px 40px rgba(0,0,0,.35);font-size:14px;line-height:1.45}
+    .panel .dialog{width:min(560px,100%)}
     .title{font-weight:700;font-size:15px;margin-bottom:10px}
     .host{font-size:18px;font-weight:700;word-break:break-all}
     .url{margin-top:4px;color:#59636e;font-size:12px;word-break:break-all;max-height:4.6em;overflow:auto}
     .warn{margin-top:10px;padding:8px 10px;border-radius:8px;background:#fff1e5;color:#953800;font-size:13px}
     .warn.ok{background:#ddf4ff;color:#0a3069}
     .allow{display:flex;gap:8px;align-items:center;margin-top:12px;font-size:13px;color:#59636e;cursor:pointer}
-    .btns{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
+    .btns{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;margin-top:14px}
     button{all:unset;cursor:pointer;padding:7px 14px;border-radius:7px;font-weight:600;font-size:13px}
     button:focus-visible{outline:2px solid #2f81f7;outline-offset:2px}
     .pri{background:#1f6feb;color:#fff}
     .sec{background:#eff2f5;color:#1f2328}
+    .danger{background:#cf222e;color:#fff}
     .toast .pri{padding:3px 9px}
-    .x{background:transparent;color:#9198a1;padding:3px 5px}
+    .x{background:transparent;color:#9198a1;padding:3px 6px}
+    .blbtn{margin-top:10px;padding:2px 0;font-size:12px;color:#cf222e}
+    .bl{margin-top:8px;padding:10px;border-radius:8px;background:#f6f8fa;border:1px solid #d1d9e0}
+    .seg{display:flex;gap:4px;flex-wrap:wrap}
+    .seg button{padding:4px 10px;font-size:12px;background:#eff2f5;color:#1f2328;border-radius:6px}
+    .seg button.on{background:#1f2328;color:#fff}
+    input.pat{display:block;width:100%;margin:8px 0 0;padding:6px 8px;border:1px solid #d1d9e0;border-radius:6px;
+      background:#fff;color:#1f2328;font:12px/1.4 ${MONO};outline:none}
+    input.pat:focus{border-color:#1f6feb;box-shadow:0 0 0 2px rgba(31,111,235,.25)}
+    .chips{display:flex;gap:4px;flex-wrap:wrap;margin-top:6px}
+    .chips button{padding:2px 8px;font:11px/1.5 ${MONO};background:#ddf4ff;color:#0a3069;border-radius:10px;
+      max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .match{margin-top:6px;font-size:12px;font-weight:600}
+    .match.yes{color:#1a7f37}.match.no{color:#cf222e}
+    .hint{margin-top:4px;font-size:11px;color:#59636e}
+    .bl .btns{margin-top:8px}
+    .sect{margin-top:14px;font-weight:700;font-size:13px}
+    .row{display:flex;gap:8px;align-items:center;justify-content:space-between;padding:5px 0;
+      border-bottom:1px solid #eaeef2;font:12px/1.4 ${MONO};word-break:break-all}
+    .tag{font:10px system-ui,sans-serif;padding:1px 6px;border-radius:8px;background:#eff2f5;color:#59636e;margin-right:6px}
+    .empty{font-size:12px;color:#59636e;padding:4px 0}
     @media (prefers-color-scheme:dark){
-      .dialog{background:#1f2328;color:#f0f3f6}.url,.allow{color:#9198a1}
-      .sec{background:#30363d;color:#f0f3f6}.warn{background:#3d2a12;color:#f0b072}
-      .warn.ok{background:#0c2d4a;color:#9cd1ff}}`;
+      .dialog{background:#1f2328;color:#f0f3f6}.url,.allow,.hint,.empty{color:#9198a1}
+      .sec,.seg button{background:#30363d;color:#f0f3f6}.seg button.on{background:#f0f3f6;color:#1f2328}
+      .warn{background:#3d2a12;color:#f0b072}.warn.ok{background:#0c2d4a;color:#9cd1ff}
+      .bl{background:#161b22;border-color:#30363d}input.pat{background:#0d1117;color:#f0f3f6;border-color:#30363d}
+      .chips button{background:#0c2d4a;color:#9cd1ff}.row{border-color:#30363d}.tag{background:#30363d;color:#9198a1}
+      .blbtn{color:#ff7b72}.match.yes{color:#3fb950}.match.no{color:#ff7b72}}`;
 
   function h(tag, attrs, ...kids) {
     const e = document.createElement(tag);
@@ -130,31 +246,59 @@
       'left:0!important;width:0!important;height:0!important;z-index:2147483647!important';
     const sr = host.attachShadow({ mode: 'closed' });
 
+    // Toast
     const toastMsg = h('span');
     const toastOpen = h('button', { class: 'pri', 'data-act': 'toast-open', text: 'Mở' });
     const toast = h('div', { class: 'toast' }, toastMsg, toastOpen,
       h('button', { class: 'x', 'data-act': 'toast-close', text: '✕' }));
     toast.hidden = true;
 
+    // Hộp xác nhận
+    const mTitle = h('div', { class: 'title' });
     const mHost = h('div', { class: 'host' });
     const mUrl = h('div', { class: 'url' });
     const mWarn = h('div', { class: 'warn' });
     const mCb = h('input', { type: 'checkbox' });
     const mCbText = h('span');
     const mAllow = h('label', { class: 'allow' }, mCb, mCbText);
+    const blToggle = h('button', { class: 'blbtn', 'data-act': 'bl-toggle', text: '🚫 Thêm vào blacklist (lần sau tự chặn, không hỏi)…' });
+    const segBtns = {};
+    const seg = h('div', { class: 'seg' }, ...Object.keys(BL_TYPES).map((t) =>
+      (segBtns[t] = h('button', { 'data-act': 'bl-type:' + t, text: BL_TYPES[t] }))));
+    const blInput = h('input', { class: 'pat', type: 'text', spellcheck: 'false', autocomplete: 'off' });
+    const blChips = h('div', { class: 'chips' });
+    const blMatch = h('div', { class: 'match' });
+    const blHint = h('div', { class: 'hint' });
+    const blScope = h('div', { class: 'hint' });
+    const blSection = h('div', { class: 'bl' }, seg, blInput, blChips, blMatch, blHint, blScope,
+      h('div', { class: 'btns' }, h('button', { class: 'danger', 'data-act': 'bl-add', text: 'Chặn & thêm vào blacklist' })));
+    blSection.hidden = true;
+    N.addEL.call(blInput, 'input', () => updateBlMatch(), false);
     const mBlock = h('button', { class: 'sec', 'data-act': 'block', text: 'Chặn' });
     const mOpen = h('button', { class: 'pri', 'data-act': 'open', text: 'Mở tab' });
-    const dialog = h('div', { class: 'dialog', role: 'dialog', 'aria-modal': 'true', 'data-act': 'noop' },
-      h('div', { class: 'title', text: 'Trang này muốn mở tab mới' }), mHost, mUrl, mWarn, mAllow,
-      h('div', { class: 'btns' }, mBlock, mOpen));
-    const modal = h('div', { class: 'backdrop', 'data-act': 'block' }, dialog);
+    const modal = h('div', { class: 'backdrop', 'data-act': 'block' },
+      h('div', { class: 'dialog', role: 'dialog', 'aria-modal': 'true', 'data-act': 'noop' },
+        mTitle, mHost, mUrl, mWarn, mAllow, blToggle, blSection, h('div', { class: 'btns' }, mBlock, mOpen)));
     modal.hidden = true;
 
+    // Bảng quản lý (Alt+Shift+B)
+    const pList = h('div');
+    const panel = h('div', { class: 'backdrop panel', 'data-act': 'panel-close' },
+      h('div', { class: 'dialog', role: 'dialog', 'data-act': 'noop' },
+        h('div', { class: 'title', text: 'AdShield – blacklist & danh sách cho phép' }), pList,
+        h('div', { class: 'btns' },
+          h('button', { class: 'sec', 'data-act': 'copy-bl', text: 'Sao chép blacklist dạng CFG' }),
+          h('button', { class: 'pri', 'data-act': 'panel-close', text: 'Đóng' }))));
+    panel.hidden = true;
+
     N.append.call(sr, h('style', { text: UI_CSS }));
-    N.append.call(sr, toast);
     N.append.call(sr, modal);
-    UI = { host, sr, toast, toastMsg, toastOpen, toastUrl: null, modal, mHost, mUrl, mWarn, mCb, mCbText,
-      mAllow, mBlock, pending: null };
+    N.append.call(sr, panel);
+    N.append.call(sr, toast);
+    UI = { host, sr, toast, toastMsg, toastOpen, toastUrl: null, toastNav: false,
+      modal, mTitle, mHost, mUrl, mWarn, mCb, mCbText, mAllow, mBlock, mOpen,
+      blToggle, blSection, segBtns, blInput, blChips, blMatch, blHint, blScope, blType: 'host', blSugg: [],
+      panel, pList, pending: null };
     return UI;
   }
   function mountUI() {
@@ -165,10 +309,12 @@
     return true;
   }
 
-  function toast(msg, openUrl) {
+  function toast(msg, openUrl, nav = false) {
     if (!CFG.showToast || !mountUI()) return;
     UI.toastMsg.textContent = msg;
     UI.toastUrl = openUrl || null;
+    UI.toastNav = nav;
+    UI.toastOpen.textContent = nav ? 'Đi tới' : 'Mở';
     UI.toastOpen.hidden = !openUrl;
     UI.toast.hidden = false;
     clearTimeout(toastTimer);
@@ -176,18 +322,26 @@
   }
   function hideToast() { if (UI) UI.toast.hidden = true; }
 
-  // Hiện hộp xác nhận. doOpen() sẽ được gọi trong chính cú click "Mở tab" của bạn (trình duyệt cho phép mở).
-  function askOpen(href, reason, doOpen) {
+  // Hiện hộp xác nhận. doOpen() chạy trong chính cú click đồng ý của bạn (trình duyệt cho phép mở).
+  // kind: 'tab' = mở tab/cửa sổ mới, 'nav' = chuyển trang hiện tại sang domain khác
+  function askOpen(href, reason, doOpen, kind = 'tab') {
     if (!mountUI()) return false;
     const host = hostOf(href);
-    UI.pending = { href, host, doOpen };
+    const nav = kind === 'nav';
+    UI.pending = { href, host, doOpen, kind };
+    UI.mTitle.textContent = nav ? `Trang này muốn chuyển từ ${location.hostname} sang:` : 'Trang này muốn mở tab mới:';
+    UI.mOpen.textContent = nav ? 'Chuyển trang' : 'Mở tab';
     UI.mHost.textContent = host || (href === 'about:blank' ? 'Trang trống (about:blank)' : href);
     UI.mUrl.textContent = href;
     UI.mWarn.className = reason ? 'warn' : 'warn ok';
-    UI.mWarn.textContent = reason ? '⚠ Nghi quảng cáo: ' + reason : 'Mở từ link/nút bạn vừa bấm.';
+    UI.mWarn.textContent = reason ? '⚠ Nghi quảng cáo: ' + reason
+      : (nav ? 'Chuyển từ link/nút bạn vừa bấm.' : 'Mở từ link/nút bạn vừa bấm.');
     UI.mAllow.hidden = !host;
     UI.mCb.checked = false;
     UI.mCbText.textContent = `Luôn cho phép ${host} trên ${location.hostname} (không hỏi lại)`;
+    UI.blToggle.hidden = !/^https?:/i.test(href);
+    UI.blSection.hidden = true;
+    UI.blType = 'host';
     UI.modal.hidden = false;
     setTimeout(() => UI.mBlock.focus(), 0);
     return true;
@@ -195,25 +349,145 @@
   function closeModal() { if (UI) { UI.modal.hidden = true; UI.pending = null; } }
   const waitingConfirm = () => !!(UI && UI.pending);
 
-  function uiAct(act) {
-    if (act === 'toast-open') {
-      const u = UI.toastUrl; hideToast();
-      if (u) N.open.call(window, u, '_blank');
-    } else if (act === 'toast-close') {
-      hideToast();
-    } else if (act === 'open' || act === 'block') {
-      const p = UI.pending;
-      const remember = UI.mCb.checked;
-      closeModal();
-      if (!p) return;
-      if (act === 'open') {
-        if (remember && p.host) addAllow(p.host);
-        log('BẠN ĐỒNG Ý mở:', p.href);
-        try { p.doOpen(); } catch (err) { console.warn('[AdShield] mở thất bại', err); }
-      } else {
-        blockedCount++;
-        log('BẠN ĐÃ CHẶN:', p.href);
+  function resolvePending(act) {
+    const p = UI.pending;
+    const remember = UI.mCb.checked;
+    closeModal();
+    if (!p) return;
+    if (act === 'open') {
+      if (remember && p.host && !isAllowed(p.host)) {
+        allowHosts.push(p.host);
+        lsSave(KEY_ALLOW, allowHosts);
+        toast(`Đã thêm ${p.host} vào danh sách cho phép của trang này`);
       }
+      log('BẠN ĐỒNG Ý:', p.href);
+      try { p.doOpen(); } catch (err) { console.warn('[AdShield] mở thất bại', err); }
+    } else {
+      blockedCount++;
+      log('BẠN ĐÃ CHẶN:', p.href);
+    }
+  }
+
+  /* ---------- Blacklist trong hộp xác nhận ---------- */
+  function blSuggestions(href, t) {
+    let u;
+    try { u = new URL(href); } catch (_) { return []; }
+    const out = [];
+    if (t === 'host') {
+      out.push(baseDomain(u.hostname), u.hostname);
+    } else if (t === 'query') {
+      const q = u.search.replace(/^\?/, '');
+      const keys = [...new Set(q.split('&').filter(Boolean).map((x) => x.split('=')[0]).filter(Boolean))];
+      keys.slice(0, 6).forEach((k) => out.push(k + '=*'));
+      if (keys.length > 1 && q.length <= 200) out.push(q);
+    } else {
+      out.push(`*://${u.hostname}${u.pathname}*`, `*://${u.hostname}/*`);
+      if (u.pathname.length > 1) out.push(`*${u.pathname}*`);
+    }
+    return [...new Set(out.filter(Boolean))];
+  }
+  function setBlType(t) {
+    if (!BL_TYPES[t]) return;
+    UI.blType = t;
+    for (const k in UI.segBtns) UI.segBtns[k].className = k === t ? 'on' : '';
+    const sugg = UI.pending ? blSuggestions(UI.pending.href, t) : [];
+    UI.blSugg = sugg;
+    UI.blChips.textContent = '';
+    sugg.forEach((s, i) => N.append.call(UI.blChips, h('button', { 'data-act': 'bl-fill:' + i, title: s, text: s })));
+    UI.blInput.value = sugg[0] || '';
+    UI.blInput.placeholder = t === 'host' ? 'vd: *.adnet.xyz' : t === 'query' ? 'vd: zoneid=*' : 'vd: *://*/go.php?*';
+    UI.blHint.textContent = BL_HINTS[t] + (t === 'query' && !sugg.length ? ' — URL này không có query string.' : '');
+    UI.blScope.textContent = `Lưu cho ${location.hostname}. Muốn áp dụng mọi trang: Alt+Shift+B → sao chép vào CFG.blacklist.`;
+    updateBlMatch();
+  }
+  function updateBlMatch() {
+    if (!UI) return null;
+    const r = compileRule(UI.blType, UI.blInput.value);
+    if (!r) {
+      UI.blMatch.className = 'match no';
+      UI.blMatch.textContent = 'Mẫu trống hoặc không hợp lệ';
+      return null;
+    }
+    let ok = false;
+    try { ok = !!UI.pending && r.test(new URL(UI.pending.href)); } catch (_) {}
+    UI.blMatch.className = ok ? 'match yes' : 'match no';
+    UI.blMatch.textContent = ok ? '✓ Khớp với URL đang yêu cầu' : '✗ Không khớp URL đang yêu cầu (vẫn lưu được)';
+    return r;
+  }
+  function addBlacklist() {
+    const r = updateBlMatch();
+    if (!r) { UI.blInput.focus(); return; }
+    const p = UI.pending;
+    if (!siteRules.some((x) => x.t === r.t && x.p === r.p)) { siteRules.push(r); saveSiteRules(); }
+    // Bỏ khỏi danh sách cho phép những host khớp luật mới (blacklist luôn thắng)
+    const n = allowHosts.length;
+    allowHosts = allowHosts.filter((x) => { try { return !r.test(new URL('https://' + x + '/')); } catch (_) { return true; } });
+    if (allowHosts.length !== n) lsSave(KEY_ALLOW, allowHosts);
+    closeModal();
+    blockedCount++;
+    log('THÊM BLACKLIST:', ruleLabel(r), '| đã chặn:', p && p.href);
+    toast('Đã chặn và thêm vào blacklist: ' + ruleLabel(r));
+  }
+
+  /* ---------- Bảng quản lý ---------- */
+  function renderPanel() {
+    const L = UI.pList;
+    L.textContent = '';
+    const sect = (t) => N.append.call(L, h('div', { class: 'sect', text: t }));
+    const empty = (t) => N.append.call(L, h('div', { class: 'empty', text: t }));
+    const row = (tag, text, act) => {
+      const r = h('div', { class: 'row' }, h('span', null, h('span', { class: 'tag', text: tag }), document.createTextNode(text)));
+      if (act) N.append.call(r, h('button', { class: 'x', 'data-act': act, title: 'Xoá', text: '✕' }));
+      N.append.call(L, r);
+    };
+    sect(`Blacklist của ${location.hostname} (${siteRules.length})`);
+    siteRules.length ? siteRules.forEach((r, i) => row(r.t, r.p, 'rm-bl:' + i)) : empty('Chưa có mục nào.');
+    sect(`Blacklist chung – CFG.blacklist (${GLOBAL_RULES.length})`);
+    GLOBAL_RULES.length ? GLOBAL_RULES.forEach((r) => row(r.t, r.p)) : empty('Trống. Sửa CFG.blacklist trong code để áp dụng cho mọi trang.');
+    sect(`Danh sách cho phép của ${location.hostname} (${allowHosts.length})`);
+    allowHosts.length ? allowHosts.forEach((x, i) => row('allow', x, 'rm-al:' + i)) : empty('Chưa có mục nào.');
+  }
+  function openPanel() {
+    if (!mountUI()) return;
+    renderPanel();
+    UI.panel.hidden = false;
+  }
+  function copyBlacklist() {
+    const txt = siteRules.map((r) => `    '${ruleLabel(r).replace(/\\/g, '\\\\').replace(/'/g, "\\'")}',`).join('\n');
+    if (!txt) { toast('Blacklist của trang này đang trống.'); return; }
+    console.log('[AdShield] Dán vào CFG.blacklist:\n' + txt);
+    const fail = () => toast('Không sao chép được, đã in ra Console (F12).');
+    try {
+      navigator.clipboard.writeText(txt).then(
+        () => toast('Đã sao chép. Dán vào CFG.blacklist để áp dụng cho mọi trang.'), fail);
+    } catch (_) { fail(); }
+  }
+
+  function uiAct(act) {
+    const i = act.indexOf(':');
+    const name = i < 0 ? act : act.slice(0, i);
+    const arg = i < 0 ? '' : act.slice(i + 1);
+    switch (name) {
+      case 'toast-open': {
+        const u = UI.toastUrl, nav = UI.toastNav;
+        hideToast();
+        if (u) nav ? navTo(u) : N.open.call(window, u, '_blank');
+        break;
+      }
+      case 'toast-close': hideToast(); break;
+      case 'open': case 'block': resolvePending(name); break;
+      case 'bl-toggle':
+        UI.blSection.hidden = !UI.blSection.hidden;
+        if (!UI.blSection.hidden) { setBlType(UI.blType); setTimeout(() => UI.blInput.focus(), 0); }
+        break;
+      case 'bl-type': setBlType(arg); UI.blInput.focus(); break;
+      case 'bl-fill': UI.blInput.value = UI.blSugg[+arg] || ''; updateBlMatch(); UI.blInput.focus(); break;
+      case 'bl-add': addBlacklist(); break;
+      case 'panel-close': UI.panel.hidden = true; break;
+      case 'copy-bl': copyBlacklist(); break;
+      case 'rm-bl': siteRules.splice(+arg, 1); saveSiteRules(); renderPanel(); break;
+      case 'rm-al': allowHosts.splice(+arg, 1); lsSave(KEY_ALLOW, allowHosts); renderPanel(); break;
+      default: break;
     }
   }
 
@@ -221,32 +495,24 @@
     'touchstart', 'touchend', 'keydown', 'keyup', 'keypress'].forEach((t) => on(window, t, (e) => {
     if (!UI || realTarget(e) !== UI.host) return;
     e.stopImmediatePropagation();
-    if (!e.isTrusted) return; // trang không thể "bấm hộ" nút Mở
+    if (!e.isTrusted) return; // trang không thể "bấm hộ" nút trong UI
     if (t === 'click') {
       const el = e.detail === 0 && UI.sr.activeElement ? UI.sr.activeElement : UI.sr.elementFromPoint(e.clientX, e.clientY);
       const actEl = el && el.closest ? el.closest('[data-act]') : null;
       if (actEl) uiAct(actEl.getAttribute('data-act'));
-    } else if (t === 'keydown' && e.key === 'Escape' && waitingConfirm()) {
-      e.preventDefault();
-      uiAct('block');
+    } else if (t === 'keydown') {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        if (!UI.panel.hidden) uiAct('panel-close');
+        else if (waitingConfirm()) uiAct('block');
+      } else if (e.key === 'Enter' && UI.sr.activeElement === UI.blInput) {
+        e.preventDefault();
+        uiAct('bl-add');
+      }
     }
   }));
 
-  /* ---------- Cài đặt theo trang ---------- */
-  const KEY_OFF = '__adshield_off', KEY_ALLOW = '__adshield_allow';
-  let isOff = false;
-  try { isOff = localStorage.getItem(KEY_OFF) === '1'; } catch (_) {}
-  let allowHosts = [];
-  try { allowHosts = JSON.parse(localStorage.getItem(KEY_ALLOW) || '[]'); } catch (_) {}
-  if (!Array.isArray(allowHosts)) allowHosts = [];
-  const isAllowed = (host) => !!host && allowHosts.includes(host);
-  function addAllow(host) {
-    if (isAllowed(host)) return;
-    allowHosts.push(host);
-    try { localStorage.setItem(KEY_ALLOW, JSON.stringify(allowHosts)); } catch (_) {}
-    toast(`Đã thêm ${host} vào danh sách cho phép của trang này`);
-  }
-
+  /* ---------- Phím tắt ---------- */
   if (isTop) {
     on(window, 'keydown', (e) => {
       if (!e.altKey || !e.shiftKey) return;
@@ -258,13 +524,19 @@
       } else if (e.code === 'KeyR') {
         e.preventDefault();
         allowHosts = [];
-        try { localStorage.removeItem(KEY_ALLOW); } catch (_) {}
+        lsSave(KEY_ALLOW, allowHosts);
         toast('AdShield: đã xoá danh sách cho phép của trang này');
+      } else if (e.code === 'KeyB') {
+        e.preventDefault();
+        openPanel();
       }
     });
   }
   if (isOff) { log('đang TẮT cho trang này (Alt+Shift+A để bật)'); return; }
-  if (isTop) log('đang chạy trên', location.host, '| chế độ xác nhận:', CFG.confirm);
+  if (isTop) {
+    log('đang chạy trên', location.host, '| tab mới:', CFG.confirm, '| chuyển trang:', CFG.confirmNavigate,
+      '| blacklist trang này:', siteRules.length, '| chung:', GLOBAL_RULES.length);
+  }
 
   /* ========================= 1. ẨN QUẢNG CÁO BẰNG CSS ========================= */
   if (CFG.cosmetic) safe('cosmetic', () => {
@@ -351,10 +623,10 @@
     });
   }
 
-  /* ========================= 4. KIỂM SOÁT TAB / CỬA SỔ MỚI ========================= */
+  /* ========================= 4. KIỂM SOÁT TAB MỚI & CHUYỂN TRANG ========================= */
   if (!CFG.popupGuard) return;
 
-  // 4a. Biết code mở tab đang chạy trong listener gắn ở đâu (document/window/body = popunder toàn trang)
+  // 4a. Biết code đang chạy trong listener gắn ở đâu (document/window/body = popunder toàn trang)
   const CTX = [];
   const GESTURE_TYPES = new Set(['click', 'mousedown', 'mouseup', 'pointerdown', 'pointerup',
     'touchstart', 'touchend', 'auxclick', 'keydown', 'keyup']);
@@ -426,6 +698,7 @@
   ['mousedown', 'pointerup', 'mouseup', 'touchend', 'click'].forEach((t) => on(window, t, contGesture));
 
   const recentGesture = () => performance.now() - G.t < CFG.gestureWindowMs;
+  const recentNavGesture = () => performance.now() - G.t < CFG.navGestureMs;
   const INTERACTIVE = 'a[href],area[href],button,input[type=button],input[type=submit],input[type=image],' +
     '[role=button],[role=link],[role=menuitem],summary,label';
   const interactiveOf = (el) => {
@@ -473,17 +746,19 @@
     return !!ov;
   }
 
-  function onBlocked(href, reason, el) {
+  function onBlocked(href, reason, el, kind = 'tab') {
     blockedCount++;
     const removed = neutralizeOverlay(el);
     const host = hostOf(href);
-    const canOpen = href && href !== 'about:blank' && !isAdUrl(href);
-    toast((removed ? 'Đã chặn tab mới và gỡ lớp phủ. ' : 'Đã chặn tab mới. ') +
-      (host ? '→ ' + host + ' ' : '') + `(${blockedCount})`, canOpen ? href : null);
+    const canOpen = href && href !== 'about:blank' && !blockReason(href);
+    const what = kind === 'nav' ? 'Đã chặn chuyển trang' : 'Đã chặn tab mới';
+    const why = /^blacklist /.test(reason.split(': ').pop()) ? ' (blacklist)' : '';
+    toast(what + why + (removed ? ' và gỡ lớp phủ. ' : '. ') +
+      (host ? '→ ' + host + ' ' : '') + `(${blockedCount})`, canOpen ? href : null, kind === 'nav');
     log('CHẶN:', reason, href);
   }
 
-  // Dấu hiệu đáng ngờ của một lần mở tab bằng script ('' = không thấy gì bất thường)
+  /* ---------- Tab / cửa sổ mới ---------- */
   function popupSuspicion(href) {
     if (href === 'about:blank') return 'mở trang trống (chiêu hay dùng của popunder)';
     if (stripHash(href) === stripHash(location.href)) return 'mở lại chính trang này (chiêu tab-under)';
@@ -500,11 +775,10 @@
     }
     return '';
   }
-
-  // Quyết định cho một lần mở tab mới: allow | ask | block
   function decide(href, susp) {
-    if (isAdUrl(href)) return { act: 'block', why: 'domain quảng cáo' };
-    if (waitingConfirm()) return { act: 'block', why: 'đang chờ bạn xác nhận một tab khác' };
+    const br = blockReason(href);
+    if (br) return { act: 'block', why: br };
+    if (waitingConfirm()) return { act: 'block', why: 'đang chờ bạn xác nhận một yêu cầu khác' };
     if (!recentGesture()) return { act: 'block', why: 'không có thao tác người dùng' };
     if (G.used) return { act: 'block', why: 'tab thứ 2 trong cùng 1 click' };
     G.used = true;
@@ -513,15 +787,55 @@
     if (CFG.confirm === 'cross' && !susp && sameOrigin(href)) return { act: 'allow', why: 'cùng trang' };
     return { act: 'ask', why: susp };
   }
-
   function handleNewTab(kind, href, susp, doOpen, el) {
     const d = decide(href, susp);
     if (d.act === 'allow') { log('CHO PHÉP', kind + ':', href, d.why); return 'allow'; }
     if (d.act === 'ask') {
       if (susp) neutralizeOverlay(el);
-      if (askOpen(href, d.why, doOpen)) { log('HỎI', kind + ':', href, d.why); return 'ask'; }
+      if (askOpen(href, d.why, doOpen, 'tab')) { log('HỎI', kind + ':', href, d.why); return 'ask'; }
     }
-    onBlocked(href, kind + ': ' + d.why, el);
+    onBlocked(href, kind + ': ' + d.why, el, 'tab');
+    return 'block';
+  }
+
+  /* ---------- Chuyển trang hiện tại sang domain khác ---------- */
+  // Chỉ kiểm soát việc chuyển trang của tab chính (không đụng iframe tự chuyển trang bên trong)
+  const isSelfTarget = (t) => {
+    if (!isTop || CFG.confirmNavigate === 'off') return false;
+    t = (t || '').toLowerCase();
+    return t === '' || t === '_self' || t === '_top' || t === '_parent';
+  };
+  function navSuspicion(href) {
+    const to = hostOf(href);
+    if (isGlobalCtx()) return 'script gắn trên toàn trang tự chuyển sang ' + to;
+    const it = interactiveOf(G.target);
+    if (!it) return 'bạn click vào vùng không phải link/nút nhưng trang lại chuyển sang ' + to;
+    if ((it.tagName === 'A' || it.tagName === 'AREA') && baseDomain(hostOf(it.href)) !== baseDomain(to)) {
+      return 'bạn click link tới ' + (hostOf(it.href) || 'trang khác') + ' nhưng trang lại chuyển sang ' + to;
+    }
+    const s = suspiciousBox(it);
+    return s ? 'phần tử bạn click ' + s : '';
+  }
+  function decideNav(href, susp, byUserLink) {
+    if (CFG.confirmNavigate === 'off') return { act: 'allow', why: '' };
+    const br = blockReason(href);
+    if (br) return { act: 'block', why: br };
+    if (sameSite(href)) return { act: 'allow', why: '' };
+    if (isAllowed(hostOf(href))) return { act: 'allow', why: 'nằm trong danh sách cho phép' };
+    if (!byUserLink && !recentNavGesture() && !CFG.confirmAutoRedirect) {
+      return { act: 'allow', why: 'trang tự chuyển hướng, không do click' };
+    }
+    if (waitingConfirm()) return { act: 'block', why: 'đang chờ bạn xác nhận một yêu cầu khác' };
+    if (CFG.confirmNavigate === 'script' && byUserLink && !susp) return { act: 'allow', why: 'bạn click link' };
+    return { act: 'ask', why: susp };
+  }
+  function handleNav(kind, href, d, doNav, el) {
+    if (d.act === 'allow') { if (!sameSite(href)) log('CHO PHÉP chuyển trang', kind + ':', href, d.why); return 'allow'; }
+    if (d.act === 'ask') {
+      if (d.why) neutralizeOverlay(el);
+      if (askOpen(href, d.why, doNav, 'nav')) { log('HỎI chuyển trang', kind + ':', href, d.why); return 'ask'; }
+    }
+    onBlocked(href, kind + ': ' + d.why, el, 'nav');
     return 'block';
   }
 
@@ -545,7 +859,13 @@
   function guardedOpen(url, target, features) {
     const href = toAbs(url);
     const newCtx = target == null || target === '' || opensNewContext(target);
-    if (!newCtx && !isAdUrl(href)) return N.open.call(window, url, target, features);
+    if (!newCtx) {
+      if (isSelfTarget(target)) { // window.open(url, '_self') = chuyển trang hiện tại
+        const r = handleNav('window.open(_self)', href, decideNav(href, navSuspicion(href), false), () => navTo(href));
+        return r === 'allow' ? N.open.call(window, url, target, features) : fakeWindow();
+      }
+      if (!blockReason(href)) return N.open.call(window, url, target, features);
+    }
     const r = handleNewTab('window.open', href, popupSuspicion(href),
       () => N.open.call(window, url, target, features));
     if (r === 'allow') return N.open.call(window, url, target, features);
@@ -577,9 +897,15 @@
   function linkGuard(a, kind) {
     const href = a.href;
     if (!href || a.hasAttribute('download') || /^javascript:/i.test(href)) return 'pass';
-    if (isAdUrl(href)) { onBlocked(href, kind + ': domain quảng cáo', a); return 'block'; }
     const target = a.getAttribute('target');
-    if (!opensNewContext(target)) return 'pass';
+    if (!opensNewContext(target)) {
+      if (!isSelfTarget(target)) {
+        const br = blockReason(href);
+        if (br) { onBlocked(href, kind + ': ' + br, a, 'nav'); return 'block'; }
+        return 'pass';
+      }
+      return handleNav(kind, href, decideNav(href, navSuspicion(href), false), () => navTo(href), a);
+    }
     return handleNewTab(kind, href, popupSuspicion(href), () => N.open.call(window, href, target, relFeatures(a)), a);
   }
   safe('link-click', () => {
@@ -599,11 +925,15 @@
     };
   });
 
-  // 4d. Form submit sang tab mới
+  // 4d. Form submit (tab mới hoặc chuyển trang)
   safe('form', () => {
     const guard = (form, resume) => {
-      if (!opensNewContext(form.getAttribute('target'))) return true;
+      const target = form.getAttribute('target');
       const href = toAbs(form.getAttribute('action') || location.href);
+      if (!opensNewContext(target)) {
+        if (!isSelfTarget(target)) return true;
+        return handleNav('form', href, decideNav(href, navSuspicion(href), false), () => { bypassNav(); resume(); }) === 'allow';
+      }
       return handleNewTab('form', href, popupSuspicion(href), resume) === 'allow';
     };
     HTMLFormElement.prototype.submit = function () {
@@ -616,7 +946,7 @@
     }
   });
 
-  // 4e. Bạn click THẬT vào link target="_blank" (hoặc lớp phủ <a> vô hình, link bị tráo href)
+  // 4e. Bạn click THẬT vào link
   on(window, 'click', (e) => {
     if (!e.isTrusted) return;
     const a = closestLink(realTarget(e));
@@ -624,11 +954,11 @@
     const href = a.href;
     const curAttr = a.getAttribute('href');
     const target = a.getAttribute('target');
+    const newCtx = opensNewContext(target);
     const stop = () => { e.preventDefault(); e.stopImmediatePropagation(); };
 
-    let hard = '';
-    if (isAdUrl(href)) hard = 'link tới domain quảng cáo';
-    else if (a === G.link && curAttr !== G.linkHref) {
+    let hard = blockReason(href);
+    if (!hard && a === G.link && curAttr !== G.linkHref) {
       const nh = baseDomain(hostOf(href));
       if (nh !== baseDomain(location.hostname) && nh !== baseDomain(hostOf(G.linkHref || ''))) {
         hard = 'href bị tráo lúc nhấn chuột';
@@ -639,21 +969,49 @@
       if (a === G.link && curAttr !== G.linkHref) {
         G.linkHref == null ? a.removeAttribute('href') : a.setAttribute('href', G.linkHref);
       }
-      onBlocked(href, 'click link: ' + hard, a);
+      onBlocked(href, 'click link: ' + hard, a, newCtx ? 'tab' : 'nav');
+      return;
+    }
+    if (a.hasAttribute('download') || /^javascript:/i.test(href)) return;
+
+    // Link mở ngay trong tab hiện tại, sang domain khác
+    if (!newCtx) {
+      if (!isSelfTarget(target) || e.ctrlKey || e.metaKey || e.shiftKey || sameSite(href)) return;
+      const sbn = suspiciousBox(a);
+      const r = handleNav('click link', href, decideNav(href, sbn ? 'link ' + sbn : '', true), () => navTo(href), a);
+      if (r !== 'allow') stop();
       return;
     }
 
-    if (!opensNewContext(target) || a.hasAttribute('download') || /^javascript:/i.test(href)) return;
+    // Link mở tab mới
     const sb = sameOrigin(href) ? '' : suspiciousBox(a);
     const susp = sb ? 'link ' + sb : '';
-    // Ctrl/Cmd/Shift + click = bạn chủ động muốn tab mới
-    if (!susp && (e.ctrlKey || e.metaKey || e.shiftKey)) { G.used = true; return; }
-
+    if (!susp && (e.ctrlKey || e.metaKey || e.shiftKey)) { G.used = true; return; } // bạn chủ động muốn tab mới
     const r = handleNewTab('click link', href, susp, () => N.open.call(window, href, target, relFeatures(a)), a);
     if (r !== 'allow') stop();
   });
 
-  // 4f. Quét chủ động: <a>/<iframe> vô hình phủ toàn trang
+  // 4f. Bắt mọi kiểu chuyển trang còn lại: location.href = ..., location.assign/replace, meta refresh...
+  //     (cần Navigation API: Chrome/Edge/Opera)
+  if (isTop && CFG.confirmNavigate !== 'off' && window.navigation) safe('navigation-api', () => {
+    on(window.navigation, 'navigate', (e) => {
+      if (!e.cancelable || e.hashChange || e.formData || e.downloadRequest != null) return;
+      if (e.navigationType === 'traverse' || e.navigationType === 'reload') return;
+      if (performance.now() < navBypassUntil) { navBypassUntil = 0; return; }
+      const href = e.destination.url;
+      const byUser = !!e.userInitiated;
+      const d = decideNav(href, byUser ? '' : navSuspicion(href), byUser);
+      const replace = e.navigationType === 'replace';
+      const r = handleNav(byUser ? 'chuyển trang' : 'script chuyển trang', href, d,
+        () => { bypassNav(); replace ? location.replace(href) : location.assign(href); });
+      if (r !== 'allow') e.preventDefault();
+    }, false);
+  });
+  if (isTop && CFG.confirmNavigate !== 'off' && !window.navigation) {
+    log('trình duyệt chưa có Navigation API: chỉ bắt được chuyển trang qua link/form/window.open, không bắt được location.href = ...');
+  }
+
+  // 4g. Quét chủ động: <a>/<iframe> vô hình phủ toàn trang
   function scanOverlays() {
     const vp = innerWidth * innerHeight;
     if (!vp || !document.body) return;
