@@ -5,9 +5,9 @@
 // @match       https://www.wa01.com/novel/*
 // @match       https://www.uukan.org/chapter/*/*
 // @match       https://ixdzs8.com/read/*
-// @version     1.15
+// @version     1.16
 // @author      -
-// @description Thêm nút Copy TXT, Download TXT và Auto Next
+// @description Thêm nút Copy TXT, Download TXT, tuỳ chọn chia 2 phần và Auto Next
 // @grant       GM_download
 // ==/UserScript==
 
@@ -51,6 +51,8 @@
     const AUTO_NEXT_PENDING_KEY = 'uukanAutoNextPending';
     const AUTO_NEXT_DELAY_SECONDS = 5;
     const AUTO_NEXT_CHECKBOX_ID = 'uukan-auto-next-checkbox';
+    const SPLIT_ENABLED_KEY = 'uukanSplitEnabled';
+    const SPLIT_CHECKBOX_ID = 'uukan-split-checkbox';
     const DOWNLOAD_FALLBACK_DELAY_MS = 1500;
     const DOWNLOAD_ROOT_FOLDER_NAME = 'uukan-txt';
 
@@ -237,10 +239,16 @@
     }
 
     async function downloadCurrentPage() {
-        const { title, text, story } = getContent();
+        const { title, text, story, fullText } = getContent();
         const folderName = getStoryFolderName(title);
-        const parts = splitContentForDownload(title, story, text);
 
+        if (!isSplitEnabled()) {
+            await downloadTxt(folderName, buildFilename(title), fullText);
+            showToast('⬇️ Đã tải chương (1 file).', 'success');
+            return;
+        }
+
+        const parts = splitContentForDownload(title, story, text);
         for (const [index, part] of parts.entries()) {
             const filename = buildFilename(title, index + 1);
             await downloadTxt(folderName, filename, part.fullText);
@@ -251,11 +259,16 @@
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    function isSplitEnabled() {
+        // Mặc định bật (chưa có giá trị => true) để giữ hành vi cũ
+        return localStorage.getItem(SPLIT_ENABLED_KEY) !== '0';
+    }
+
     function buildFilename(title, partNumber) {
         const chapterMatch = title.match(/第\s*(\d+)\s*章/);
         const chapterLabel = chapterMatch ? `第${chapterMatch[1]}章` : title;
         const safeChapterLabel = sanitizePathSegment(chapterLabel, 'chapter');
-        return `${safeChapterLabel} (${partNumber})`;
+        return partNumber ? `${safeChapterLabel} (${partNumber})` : safeChapterLabel;
     }
 
     function splitContentForDownload(title, story, text) {
@@ -274,16 +287,17 @@
             createPart('第2/2页', lines.slice(middleLineIndex)),
         ];
     }
+
     function getStoryName() {
-        return document.querySelector(config.bookTitle)?.innerText.trim() || document.querySelector('#bkName')?.value ||
-        document.querySelector('.breadcrumbs li:last-child')?.textContent
-        ;
+        return document.querySelector(config.bookTitle)?.innerText.trim() ||
+            document.querySelector('#bkName')?.value ||
+            document.querySelector('.breadcrumbs li:last-child')?.textContent;
     }
 
     function getContent() {
         document.querySelectorAll(`${config.contentSel} *:not(p):not(br)`).forEach(el => el.remove());
         const title = document.querySelector(config.titleSel)?.innerText.trim() || '';
-        let text = (document.querySelector(config.contentSel)?.innerText.trim() || '').replace('read3();','');
+        let text = (document.querySelector(config.contentSel)?.innerText.trim() || '').replace('read3();', '');
         const story = getStoryName();
         const psIndex = text.search(/^\s*PS：/m);
         if (psIndex !== -1) text = text.slice(0, psIndex).trimEnd();
@@ -298,21 +312,37 @@
         return btn;
     }
 
-    function createAutoNextControl() {
+    function createCheckboxControl(id, labelText, checked) {
         const label = document.createElement('label');
         label.style.cssText = 'margin-left:10px;font-size:14px;cursor:pointer;user-select:none';
 
         const checkbox = document.createElement('input');
         checkbox.type = 'checkbox';
-        checkbox.id = AUTO_NEXT_CHECKBOX_ID;
-        checkbox.checked = localStorage.getItem(AUTO_NEXT_ENABLED_KEY) === '1';
+        checkbox.id = id;
+        checkbox.checked = checked;
         checkbox.style.cssText = 'margin-right:4px;vertical-align:middle';
 
         const text = document.createElement('span');
-        text.textContent = 'Auto Next';
+        text.textContent = labelText;
 
         label.append(checkbox, text);
         return { label, checkbox, text };
+    }
+
+    function createSplitControl() {
+        const control = createCheckboxControl(SPLIT_CHECKBOX_ID, 'Chia 2 phần', isSplitEnabled());
+        control.checkbox.addEventListener('change', () => {
+            localStorage.setItem(SPLIT_ENABLED_KEY, control.checkbox.checked ? '1' : '0');
+        });
+        return control;
+    }
+
+    function createAutoNextControl() {
+        return createCheckboxControl(
+            AUTO_NEXT_CHECKBOX_ID,
+            'Auto Next',
+            localStorage.getItem(AUTO_NEXT_ENABLED_KEY) === '1'
+        );
     }
 
     function setAutoNextEnabled(enabled) {
@@ -342,11 +372,11 @@
 
     async function runDownloadAndNext() {
         await downloadCurrentPage();
-        setTimeout(()=>{
+        setTimeout(() => {
             if (localStorage.getItem(AUTO_NEXT_ENABLED_KEY) === '1') {
                 goToNextPage();
             }
-        }, 250)
+        }, 250);
     }
 
     function startAutoNextCountdown(checkbox, text) {
@@ -402,6 +432,7 @@
             }
         });
 
+        const split = createSplitControl();
         const autoNext = createAutoNextControl();
         let autoNextTimer = null;
 
@@ -424,7 +455,7 @@
 
         const wrapper = document.createElement('div');
         wrapper.style.cssText = 'text-align:center;margin-bottom:8px';
-        wrapper.append(btnCopy, btnDownload, autoNext.label);
+        wrapper.append(btnCopy, btnDownload, split.label, autoNext.label);
         anchor.insertAdjacentElement(config.insertPosition, wrapper);
 
         autoNextTimer = startAutoNextCountdown(autoNext.checkbox, autoNext.text);
