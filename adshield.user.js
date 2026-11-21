@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         AdShield – Chặn quảng cáo & hỏi trước khi mở tab / chuyển trang
 // @namespace    vinhtt.adshield
-// @version      1.5.3
+// @version      1.5.4
 // @icon         https://cdn-icons-png.flaticon.com/64/3821/3821993.png
 // @description  Ẩn quảng cáo, chặn script quảng cáo, mọi tab mới hoặc chuyển trang sang domain khác đều phải xác nhận; blacklist theo domain/query/URL có wildcard. Nút nổi 🚫 (trang có blacklist) hoặc Alt+Shift+B: quản lý blacklist (thêm/sửa/xoá). Alt+Shift+A: tắt/bật cho trang. Alt+Shift+R: xoá danh sách cho phép.
 // @match        *://*/*
@@ -32,7 +32,7 @@
     // Blacklist dùng chung cho MỌI trang. Dạng 'loại:mẫu', hỗ trợ wildcard *:
     //   'host:popads.xyz'   'host:*.adnet.*'   'query:zoneid=*'   'url:*://*/go.php?*'
     // Blacklist thêm từ hộp xác nhận được lưu riêng cho từng trang; Alt+Shift+B để xem/sửa/xoá/sao chép.
-    blacklist: ['url:*://*.facebook.com/tr*'],
+    blacklist: ['url:*://*.facebook.com/tr*', 'url:about:blank'],
     cosmetic: true,          // Ẩn phần tử quảng cáo bằng CSS
     blockAdRequests: true,   // Chặn script/iframe/fetch/XHR tới domain quảng cáo
     popupGuard: true,        // Kiểm soát tab/cửa sổ mới
