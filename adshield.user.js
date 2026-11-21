@@ -31,7 +31,7 @@
     // Blacklist dùng chung cho MỌI trang. Dạng 'loại:mẫu', hỗ trợ wildcard *:
     //   'host:popads.xyz'   'host:*.adnet.*'   'query:zoneid=*'   'url:*://*/go.php?*'
     // Blacklist thêm từ hộp xác nhận được lưu riêng cho từng trang; Alt+Shift+B để xem/sửa/xoá/sao chép.
-    blacklist: [],
+    blacklist: ['url:*://*.facebook.com/tr*'],
     cosmetic: true,          // Ẩn phần tử quảng cáo bằng CSS
     blockAdRequests: true,   // Chặn script/iframe/fetch/XHR tới domain quảng cáo
     popupGuard: true,        // Kiểm soát tab/cửa sổ mới
