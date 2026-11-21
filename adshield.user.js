@@ -1,7 +1,8 @@
+
 // ==UserScript==
 // @name         AdShield – Chặn quảng cáo & hỏi trước khi mở tab / chuyển trang
 // @namespace    vinhtt.adshield
-// @version      1.5.2
+// @version      1.5.3
 // @icon         https://cdn-icons-png.flaticon.com/64/3821/3821993.png
 // @description  Ẩn quảng cáo, chặn script quảng cáo, mọi tab mới hoặc chuyển trang sang domain khác đều phải xác nhận; blacklist theo domain/query/URL có wildcard. Nút nổi 🚫 (trang có blacklist) hoặc Alt+Shift+B: quản lý blacklist (thêm/sửa/xoá). Alt+Shift+A: tắt/bật cho trang. Alt+Shift+R: xoá danh sách cho phép.
 // @match        *://*/*
@@ -161,6 +162,10 @@
     if (!siteRules.length && !GLOBAL_RULES.length) return null;
     let u;
     try { u = new URL(href, location.href); } catch (_) { return null; }
+    if (/^about:blank$/i.test(u.href)) { // trang trống: chỉ luật loại 'url' mới áp dụng
+      const ok = (r) => r.t === 'url' && r.test(u);
+      return siteRules.find(ok) || GLOBAL_RULES.find(ok) || null;
+    }
     if (!/^https?:$/.test(u.protocol)) return null;
     return siteRules.find((r) => r.test(u)) || GLOBAL_RULES.find((r) => r.test(u)) || null;
   }
@@ -225,7 +230,7 @@
       border-bottom:1px solid #eaeef2;font:12px/1.4 ${MONO};word-break:break-all}
     .tag{font:10px system-ui,sans-serif;padding:1px 6px;border-radius:8px;background:#eff2f5;color:#59636e;margin-right:6px}
     .empty{font-size:12px;color:#59636e;padding:4px 0}
-    .fab{position:fixed;right:12px;bottom:12px;padding:4px 9px;border-radius:14px;background:#1f2328;color:#f0f3f6;
+    .fab{position:fixed;left:12px;bottom:12px;padding:4px 9px;border-radius:14px;background:#1f2328;color:#f0f3f6;
       font-size:12px;font-weight:600;opacity:.55;box-shadow:0 2px 8px rgba(0,0,0,.35)}
     .fab:hover{opacity:1}
     .row .acts{display:flex;flex-shrink:0}
@@ -361,9 +366,9 @@
     UI.mAllow.hidden = !host;
     UI.mCb.checked = false;
     UI.mCbText.textContent = `Luôn cho phép ${host} trên ${location.hostname} (không hỏi lại)`;
-    UI.blToggle.hidden = !/^https?:/i.test(href);
+    UI.blToggle.hidden = !/^(https?:|about:blank$)/i.test(href);
     UI.blSection.hidden = true;
-    UI.blType = 'host';
+    UI.blType = href === 'about:blank' ? 'url' : 'host';
     UI.modal.hidden = false;
     setTimeout(() => UI.mBlock.focus(), 0);
     return true;
@@ -392,6 +397,7 @@
 
   /* ---------- Blacklist trong hộp xác nhận ---------- */
   function blSuggestions(href, t) {
+    if (href === 'about:blank') return t === 'url' ? ['about:blank'] : [];
     let u;
     try { u = new URL(href); } catch (_) { return []; }
     const out = [];
