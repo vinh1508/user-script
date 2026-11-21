@@ -224,7 +224,7 @@
       border-bottom:1px solid #eaeef2;font:12px/1.4 ${MONO};word-break:break-all}
     .tag{font:10px system-ui,sans-serif;padding:1px 6px;border-radius:8px;background:#eff2f5;color:#59636e;margin-right:6px}
     .empty{font-size:12px;color:#59636e;padding:4px 0}
-    .fab{position:fixed;left:12px;bottom:12px;padding:4px 9px;border-radius:14px;background:#1f2328;color:#f0f3f6;
+    .fab{position:fixed;right:12px;bottom:12px;padding:4px 9px;border-radius:14px;background:#1f2328;color:#f0f3f6;
       font-size:12px;font-weight:600;opacity:.55;box-shadow:0 2px 8px rgba(0,0,0,.35)}
     .fab:hover{opacity:1}
     .row .acts{display:flex;flex-shrink:0}
