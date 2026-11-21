@@ -1,7 +1,8 @@
 // ==UserScript==
 // @name         AdShield – Chặn quảng cáo & hỏi trước khi mở tab / chuyển trang
 // @namespace    vinhtt.adshield
-// @version      1.5.0
+// @version      1.5.1
+// @icon         https://cdn-icons-png.flaticon.com/64/3821/3821993.png
 // @description  Ẩn quảng cáo, chặn script quảng cáo, mọi tab mới hoặc chuyển trang sang domain khác đều phải xác nhận; blacklist theo domain/query/URL có wildcard. Nút nổi 🚫 (trang có blacklist) hoặc Alt+Shift+B: quản lý blacklist (thêm/sửa/xoá). Alt+Shift+A: tắt/bật cho trang. Alt+Shift+R: xoá danh sách cho phép.
 // @match        *://*/*
 // @run-at       document-start
