@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         AdShield – Chặn quảng cáo & hỏi trước khi mở tab / chuyển trang
 // @namespace    vinhtt.adshield
-// @version      1.4.0
-// @description  Ẩn quảng cáo, chặn script quảng cáo, mọi tab mới hoặc chuyển trang sang domain khác đều phải xác nhận; blacklist theo domain/query/URL có wildcard. Alt+Shift+A: tắt/bật cho trang. Alt+Shift+B: quản lý blacklist. Alt+Shift+R: xoá danh sách cho phép.
+// @version      1.5.0
+// @description  Ẩn quảng cáo, chặn script quảng cáo, mọi tab mới hoặc chuyển trang sang domain khác đều phải xác nhận; blacklist theo domain/query/URL có wildcard. Nút nổi 🚫 (trang có blacklist) hoặc Alt+Shift+B: quản lý blacklist (thêm/sửa/xoá). Alt+Shift+A: tắt/bật cho trang. Alt+Shift+R: xoá danh sách cho phép.
 // @match        *://*/*
 // @run-at       document-start
 // @grant        none
@@ -29,7 +29,7 @@
     confirmAutoRedirect: false,  // true = hỏi cả khi trang tự chuyển hướng mà không có click nào
     // Blacklist dùng chung cho MỌI trang. Dạng 'loại:mẫu', hỗ trợ wildcard *:
     //   'host:popads.xyz'   'host:*.adnet.*'   'query:zoneid=*'   'url:*://*/go.php?*'
-    // Blacklist thêm từ hộp xác nhận được lưu riêng cho từng trang; Alt+Shift+B để xem/xoá/sao chép.
+    // Blacklist thêm từ hộp xác nhận được lưu riêng cho từng trang; Alt+Shift+B để xem/sửa/xoá/sao chép.
     blacklist: [],
     cosmetic: true,          // Ẩn phần tử quảng cáo bằng CSS
     blockAdRequests: true,   // Chặn script/iframe/fetch/XHR tới domain quảng cáo
@@ -224,6 +224,10 @@
       border-bottom:1px solid #eaeef2;font:12px/1.4 ${MONO};word-break:break-all}
     .tag{font:10px system-ui,sans-serif;padding:1px 6px;border-radius:8px;background:#eff2f5;color:#59636e;margin-right:6px}
     .empty{font-size:12px;color:#59636e;padding:4px 0}
+    .fab{position:fixed;left:12px;bottom:12px;padding:4px 9px;border-radius:14px;background:#1f2328;color:#f0f3f6;
+      font-size:12px;font-weight:600;opacity:.55;box-shadow:0 2px 8px rgba(0,0,0,.35)}
+    .fab:hover{opacity:1}
+    .row .acts{display:flex;flex-shrink:0}
     @media (prefers-color-scheme:dark){
       .dialog{background:#1f2328;color:#f0f3f6}.url,.allow,.hint,.empty{color:#9198a1}
       .sec,.seg button{background:#30363d;color:#f0f3f6}.seg button.on{background:#f0f3f6;color:#1f2328}
@@ -281,24 +285,41 @@
         mTitle, mHost, mUrl, mWarn, mAllow, blToggle, blSection, h('div', { class: 'btns' }, mBlock, mOpen)));
     modal.hidden = true;
 
-    // Bảng quản lý (Alt+Shift+B)
+    // Bảng quản lý (Alt+Shift+B hoặc bấm nút nổi)
     const pList = h('div');
+    const pSegBtns = {};
+    const pSeg = h('div', { class: 'seg' }, ...Object.keys(BL_TYPES).map((t) =>
+      (pSegBtns[t] = h('button', { 'data-act': 'p-type:' + t, text: BL_TYPES[t] }))));
+    const pInput = h('input', { class: 'pat', type: 'text', spellcheck: 'false', autocomplete: 'off' });
+    const pHint = h('div', { class: 'hint' });
+    const pErr = h('div', { class: 'match no' });
+    const pCancel = h('button', { class: 'sec', 'data-act': 'p-cancel', text: 'Huỷ sửa' });
+    pCancel.hidden = true;
+    const pSave = h('button', { class: 'danger', 'data-act': 'p-save', text: 'Thêm vào blacklist' });
+    const pForm = h('div', { class: 'bl' }, pSeg, pInput, pHint, pErr, h('div', { class: 'btns' }, pCancel, pSave));
     const panel = h('div', { class: 'backdrop panel', 'data-act': 'panel-close' },
       h('div', { class: 'dialog', role: 'dialog', 'data-act': 'noop' },
-        h('div', { class: 'title', text: 'AdShield – blacklist & danh sách cho phép' }), pList,
+        h('div', { class: 'title', text: 'AdShield – blacklist & danh sách cho phép' }), pForm, pList,
         h('div', { class: 'btns' },
           h('button', { class: 'sec', 'data-act': 'copy-bl', text: 'Sao chép blacklist dạng CFG' }),
           h('button', { class: 'pri', 'data-act': 'panel-close', text: 'Đóng' }))));
     panel.hidden = true;
 
+    // Nút nổi nhỏ: chỉ hiện khi trang có blacklist riêng
+    const fab = h('button', { class: 'fab', 'data-act': 'fab', title: 'AdShield – xem/sửa blacklist của trang này' });
+    fab.hidden = true;
+
     N.append.call(sr, h('style', { text: UI_CSS }));
+    N.append.call(sr, fab);
     N.append.call(sr, modal);
     N.append.call(sr, panel);
     N.append.call(sr, toast);
     UI = { host, sr, toast, toastMsg, toastOpen, toastUrl: null, toastNav: false,
       modal, mTitle, mHost, mUrl, mWarn, mCb, mCbText, mAllow, mBlock, mOpen,
       blToggle, blSection, segBtns, blInput, blChips, blMatch, blHint, blScope, blType: 'host', blSugg: [],
-      panel, pList, pending: null };
+      panel, pList, pending: null,
+      fab, pSegBtns, pInput, pHint, pErr, pSave, pCancel, pType: 'host', editIdx: -1 };
+    setPType('host');
     return UI;
   }
   function mountUI() {
@@ -419,36 +440,94 @@
     if (!r) { UI.blInput.focus(); return; }
     const p = UI.pending;
     if (!siteRules.some((x) => x.t === r.t && x.p === r.p)) { siteRules.push(r); saveSiteRules(); }
-    // Bỏ khỏi danh sách cho phép những host khớp luật mới (blacklist luôn thắng)
-    const n = allowHosts.length;
-    allowHosts = allowHosts.filter((x) => { try { return !r.test(new URL('https://' + x + '/')); } catch (_) { return true; } });
-    if (allowHosts.length !== n) lsSave(KEY_ALLOW, allowHosts);
+    dropAllowedMatching(r);
     closeModal();
+    refreshFab();
     blockedCount++;
     log('THÊM BLACKLIST:', ruleLabel(r), '| đã chặn:', p && p.href);
     toast('Đã chặn và thêm vào blacklist: ' + ruleLabel(r));
   }
 
   /* ---------- Bảng quản lý ---------- */
+  function dropAllowedMatching(r) { // blacklist luôn thắng danh sách cho phép
+    const n = allowHosts.length;
+    allowHosts = allowHosts.filter((x) => { try { return !r.test(new URL('https://' + x + '/')); } catch (_) { return true; } });
+    if (allowHosts.length !== n) lsSave(KEY_ALLOW, allowHosts);
+  }
+  function refreshFab() {
+    if (!UI) return;
+    UI.fab.hidden = !siteRules.length;
+    UI.fab.textContent = '🚫 ' + siteRules.length;
+  }
+
+  function setPType(t) {
+    if (!BL_TYPES[t]) return;
+    UI.pType = t;
+    for (const k in UI.pSegBtns) UI.pSegBtns[k].className = k === t ? 'on' : '';
+    UI.pHint.textContent = BL_HINTS[t];
+    UI.pInput.placeholder = t === 'host' ? 'vd: *.adnet.xyz' : t === 'query' ? 'vd: zoneid=*' : 'vd: *://*/go.php?*';
+  }
+  function resetForm() {
+    UI.editIdx = -1;
+    UI.pInput.value = '';
+    UI.pErr.textContent = '';
+    UI.pSave.textContent = 'Thêm vào blacklist';
+    UI.pCancel.hidden = true;
+    setPType('host');
+  }
+  function startEdit(i) {
+    const r = siteRules[i];
+    if (!r) return;
+    UI.editIdx = i;
+    setPType(r.t);
+    UI.pInput.value = r.p;
+    UI.pErr.textContent = '';
+    UI.pSave.textContent = 'Lưu thay đổi';
+    UI.pCancel.hidden = false;
+    UI.pInput.focus();
+  }
+  function saveRuleFromPanel() {
+    const r = compileRule(UI.pType, UI.pInput.value);
+    if (!r) { UI.pErr.textContent = 'Mẫu trống hoặc không hợp lệ'; UI.pInput.focus(); return; }
+    if (siteRules.some((x, i) => i !== UI.editIdx && x.t === r.t && x.p === r.p)) {
+      UI.pErr.textContent = 'Mẫu này đã có trong blacklist'; return;
+    }
+    const editing = UI.editIdx >= 0;
+    if (editing) siteRules[UI.editIdx] = r; else siteRules.push(r);
+    saveSiteRules();
+    dropAllowedMatching(r);
+    log(editing ? 'SỬA BLACKLIST:' : 'THÊM BLACKLIST:', ruleLabel(r));
+    resetForm();
+    renderPanel();
+    refreshFab();
+  }
+
   function renderPanel() {
     const L = UI.pList;
     L.textContent = '';
     const sect = (t) => N.append.call(L, h('div', { class: 'sect', text: t }));
     const empty = (t) => N.append.call(L, h('div', { class: 'empty', text: t }));
-    const row = (tag, text, act) => {
+    const row = (tag, text, acts) => {
       const r = h('div', { class: 'row' }, h('span', null, h('span', { class: 'tag', text: tag }), document.createTextNode(text)));
-      if (act) N.append.call(r, h('button', { class: 'x', 'data-act': act, title: 'Xoá', text: '✕' }));
+      if (acts && acts.length) {
+        const box = h('span', { class: 'acts' });
+        acts.forEach(([act, title, label]) => N.append.call(box, h('button', { class: 'x', 'data-act': act, title, text: label })));
+        N.append.call(r, box);
+      }
       N.append.call(L, r);
     };
     sect(`Blacklist của ${location.hostname} (${siteRules.length})`);
-    siteRules.length ? siteRules.forEach((r, i) => row(r.t, r.p, 'rm-bl:' + i)) : empty('Chưa có mục nào.');
+    siteRules.length
+      ? siteRules.forEach((r, i) => row(r.t, r.p, [['edit-bl:' + i, 'Sửa', '✎'], ['rm-bl:' + i, 'Xoá', '✕']]))
+      : empty('Chưa có mục nào.');
     sect(`Blacklist chung – CFG.blacklist (${GLOBAL_RULES.length})`);
     GLOBAL_RULES.length ? GLOBAL_RULES.forEach((r) => row(r.t, r.p)) : empty('Trống. Sửa CFG.blacklist trong code để áp dụng cho mọi trang.');
     sect(`Danh sách cho phép của ${location.hostname} (${allowHosts.length})`);
-    allowHosts.length ? allowHosts.forEach((x, i) => row('allow', x, 'rm-al:' + i)) : empty('Chưa có mục nào.');
+    allowHosts.length ? allowHosts.forEach((x, i) => row('allow', x, [['rm-al:' + i, 'Xoá', '✕']])) : empty('Chưa có mục nào.');
   }
   function openPanel() {
     if (!mountUI()) return;
+    resetForm();
     renderPanel();
     UI.panel.hidden = false;
   }
@@ -483,9 +562,14 @@
       case 'bl-type': setBlType(arg); UI.blInput.focus(); break;
       case 'bl-fill': UI.blInput.value = UI.blSugg[+arg] || ''; updateBlMatch(); UI.blInput.focus(); break;
       case 'bl-add': addBlacklist(); break;
+      case 'fab': UI.panel.hidden ? openPanel() : (UI.panel.hidden = true); break;
       case 'panel-close': UI.panel.hidden = true; break;
       case 'copy-bl': copyBlacklist(); break;
-      case 'rm-bl': siteRules.splice(+arg, 1); saveSiteRules(); renderPanel(); break;
+      case 'p-type': setPType(arg); UI.pInput.focus(); break;
+      case 'p-save': saveRuleFromPanel(); break;
+      case 'p-cancel': resetForm(); break;
+      case 'edit-bl': startEdit(+arg); break;
+      case 'rm-bl': siteRules.splice(+arg, 1); saveSiteRules(); resetForm(); renderPanel(); refreshFab(); break;
       case 'rm-al': allowHosts.splice(+arg, 1); lsSave(KEY_ALLOW, allowHosts); renderPanel(); break;
       default: break;
     }
@@ -508,6 +592,9 @@
       } else if (e.key === 'Enter' && UI.sr.activeElement === UI.blInput) {
         e.preventDefault();
         uiAct('bl-add');
+      } else if (e.key === 'Enter' && UI.sr.activeElement === UI.pInput) {
+        e.preventDefault();
+        uiAct('p-save');
       }
     }
   }));
@@ -533,6 +620,11 @@
     });
   }
   if (isOff) { log('đang TẮT cho trang này (Alt+Shift+A để bật)'); return; }
+  if (isTop && siteRules.length) {
+    const bootFab = () => { if (mountUI()) refreshFab(); };
+    bootFab();
+    on(document, 'DOMContentLoaded', bootFab, false);
+  }
   if (isTop) {
     log('đang chạy trên', location.host, '| tab mới:', CFG.confirm, '| chuyển trang:', CFG.confirmNavigate,
       '| blacklist trang này:', siteRules.length, '| chung:', GLOBAL_RULES.length);
